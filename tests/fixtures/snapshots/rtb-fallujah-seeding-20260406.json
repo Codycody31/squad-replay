@@ -1,0 +1,147 @@
+{
+  "source": {
+    "file_name": "rtb-fallujah-seeding-20260406.replay",
+    "size_bytes": 34545014,
+    "sha256": "8f3f3dfc8333e72db0311df262cf80ab8b946109726e4017b782088f90ebc4a7"
+  },
+  "replay": {
+    "map_name": "/Game/Maps/Fallujah_City/Gameplay_Layers/Fallujah_Seed_v1",
+    "squad_version": "//Squad/v10.3.1",
+    "duration_ms": 1606368
+  },
+  "counts": {
+    "teams": 2,
+    "squads": 2,
+    "players": 9
+  },
+  "actors": {
+    "vehicles": 0,
+    "helicopters": 0,
+    "deployables": 6,
+    "components": 2283
+  },
+  "tracks": {
+    "players": {
+      "tracks": 4,
+      "total_samples": 3540
+    },
+    "vehicles": {
+      "tracks": 0,
+      "total_samples": 0
+    },
+    "helicopters": {
+      "tracks": 0,
+      "total_samples": 0
+    }
+  },
+  "events": {
+    "kills": 11,
+    "deployments": 6,
+    "seat_changes": 0,
+    "component_states": 0,
+    "vehicle_states": 0,
+    "weapon_states": 0,
+    "properties": 1303422
+  },
+  "diagnostics": {
+    "frames_processed": 102560,
+    "packets_processed": 613352,
+    "actor_opens": 1970,
+    "export_groups_discovered": 112,
+    "guid_to_path_size": 5464,
+    "property_replications": 1303422,
+    "position_samples": 8146,
+    "vehicle_position_samples": 0,
+    "replay_data_chunks": 107,
+    "warnings": 0
+  },
+  "compat": {
+    "map_name": "/Game/Maps/Fallujah_City/Gameplay_Layers/Fallujah_Seed_v1",
+    "squad_version": "//Squad/v10.3.1",
+    "match_duration_seconds": 1606,
+    "kills": 11,
+    "kills_by_second_buckets": 6,
+    "player_stat_entries": 8,
+    "positions_seconds": 1366,
+    "helicopter_positions_seconds": 0,
+    "vehicle_positions_seconds": 0,
+    "deployable_events": 6
+  },
+  "players": [
+    {
+      "name": "Almorahadin",
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": "Envixity",
+      "team_id": 1,
+      "squad_id": 1,
+      "has_steam_id": true,
+      "has_eos_id": true
+    },
+    {
+      "name": "Ethan",
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": "Insidious Fiddler",
+      "team_id": 1,
+      "squad_id": 1,
+      "has_steam_id": true,
+      "has_eos_id": true
+    },
+    {
+      "name": "Music Medic",
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": "Zeober",
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": "minutespinach",
+      "team_id": 1,
+      "squad_id": 1,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": "wazgardi200",
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    },
+    {
+      "name": null,
+      "team_id": null,
+      "squad_id": null,
+      "has_steam_id": false,
+      "has_eos_id": false
+    }
+  ],
+  "first_kill": {
+    "t_ms": 75399,
+    "victim_name": "Zeober",
+    "killer_name": null,
+    "was_incap": true
+  },
+  "last_kill": {
+    "t_ms": 1527853,
+    "victim_name": "minutespinach",
+    "killer_name": null,
+    "was_incap": false
+  }
+}

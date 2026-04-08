@@ -1,13 +1,8 @@
 mod common;
 
-use common::{sample_bundle, unique_path};
+use common::{fixture_dir, sample_bundle, unique_path};
 use squadreplay::{Error, ParseOptions, compat, parse_bytes, parse_file, read_bundle, sqrb, sqrj};
 use std::fs;
-use std::path::PathBuf;
-
-fn fixture_dir() -> Option<PathBuf> {
-    std::env::var_os("SQUADREPLAY_TEST_FIXTURE_DIR").map(PathBuf::from)
-}
 
 #[test]
 fn read_bundle_auto_detects_sqrj_and_sqrb() {

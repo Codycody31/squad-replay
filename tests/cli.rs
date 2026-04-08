@@ -1,6 +1,6 @@
 mod common;
 
-use common::{sample_bundle, unique_path};
+use common::{fixture_dir, sample_bundle, unique_path};
 use squadreplay::{sqrb, sqrj};
 use std::ffi::OsStr;
 use std::fs;
@@ -92,11 +92,10 @@ fn show_and_unpack_work_with_generated_bundles() {
 
 #[test]
 fn parse_json_output_shape_is_verified_when_fixture_is_available() {
-    let Some(fixture_dir) = std::env::var_os("SQUADREPLAY_TEST_FIXTURE_DIR") else {
+    let Some(fixture_dir) = fixture_dir() else {
         return;
     };
-    let fixture_path =
-        std::path::Path::new(&fixture_dir).join("rtb-jensens-range-wpmc-vs-turkey-20260407.replay");
+    let fixture_path = fixture_dir.join("rtb-jensens-range-wpmc-vs-turkey-20260407.replay");
     if !fixture_path.exists() {
         return;
     }
