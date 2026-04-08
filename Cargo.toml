@@ -1,0 +1,40 @@
+[package]
+name = "squadreplay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+default-run = "squadreplay"
+description = "Library-first Rust parser and CLI for Squad UE5 replay files"
+license = "MPL-2.0"
+readme = "README.md"
+repository = "https://github.com/Codycody31/squad-replay"
+homepage = "https://github.com/Codycody31/squad-replay"
+keywords = ["squad", "replay", "parser", "cli", "ue5"]
+categories = ["command-line-utilities", "parser-implementations"]
+include = [
+    "src/**",
+    "tests/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+[lib]
+name = "squadreplay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squadreplay"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
+regex = "1.10"
+rmp-serde = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+zstd = "0.13"
