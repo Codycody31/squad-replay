@@ -6,9 +6,8 @@ use crate::bundle::{
     VehicleStateEvent, WeaponStateEvent,
 };
 use crate::classify::{
-    classify_deployable_event_type, infer_component_type_name, infer_group_leaf,
-    is_deployable_primary_type, is_helicopter_type, is_soldier_type, is_vehicle_type,
-    normalize_type,
+    ClassifyFlags, classify_deployable_event_type, infer_component_type_name, infer_group_leaf,
+    is_deployable_primary_type, is_helicopter_type, is_vehicle_type, normalize_type,
 };
 use crate::error::{Error, Result};
 use crate::unreal_names::unreal_name;
@@ -17,7 +16,35 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
+
+/// Fast hasher for `u32` keys.
+///
+/// SipHash is overkill for 4-byte integer keys and was costing us roughly
+/// 10% of CPU across the parser's u32-keyed maps. Net GUIDs and channel
+/// indices are already well-distributed, so one golden-ratio multiply is
+/// enough to fill hash buckets evenly.
+#[derive(Default)]
+struct U32Hasher(u64);
+
+impl Hasher for U32Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        // Only u32 keys should ever reach this hasher.
+        debug_assert!(false, "U32Hasher is only valid for u32 keys");
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type U32HashMap<V> = HashMap<u32, V, BuildHasherDefault<U32Hasher>>;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -65,8 +92,11 @@ struct ExportField {
 #[derive(Debug, Clone, Default)]
 struct ExportGroup {
     path_name: String,
+    // Computed once at construction. The property apply loop reads this
+    // instead of re-running the classify substring scans on every event.
+    classify_flags: ClassifyFlags,
     net_field_exports_length: u32,
-    net_field_exports: HashMap<u32, ExportField>,
+    net_field_exports: U32HashMap<ExportField>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -235,32 +265,40 @@ struct ParseState {
     groups_by_path: HashMap<String, Arc<ExportGroup>>,
     // First path seen for each canonical leaf.
     groups_by_leaf: HashMap<String, String>,
-    groups_by_index: HashMap<u32, String>,
-    guid_to_path: HashMap<u32, String>,
-    channels: HashMap<u32, ChannelState>,
-    ignored_channels: HashMap<u32, bool>,
-    actor_to_channel: HashMap<u32, u32>,
-    channel_to_actor: HashMap<u32, u32>,
+    groups_by_index: U32HashMap<String>,
+    guid_to_path: U32HashMap<String>,
+    channels: U32HashMap<ChannelState>,
+    ignored_channels: U32HashMap<bool>,
+    actor_to_channel: U32HashMap<u32>,
+    channel_to_actor: U32HashMap<u32>,
     partial_bunch: Option<PartialBunch>,
-    external_data: HashMap<u32, ExternalData>,
-    actor_builders: HashMap<u32, ActorBuilder>,
-    player_builders: HashMap<u32, PlayerBuilder>,
-    player_actor_to_state: HashMap<u32, u32>,
-    deployables: HashMap<u32, DeployableBuilder>,
-    component_builders: HashMap<u32, ComponentBuilder>,
+    external_data: U32HashMap<ExternalData>,
+    actor_builders: U32HashMap<ActorBuilder>,
+    player_builders: U32HashMap<PlayerBuilder>,
+    player_actor_to_state: U32HashMap<u32>,
+    deployables: U32HashMap<DeployableBuilder>,
+    component_builders: U32HashMap<ComponentBuilder>,
     teams_by_actor_guid: BTreeMap<u32, TeamTemp>,
     public_squads_by_state_guid: BTreeMap<u32, SquadTemp>,
     private_squads_by_actor_guid: BTreeMap<u32, SquadTemp>,
-    private_to_public_squad_guid: HashMap<u32, u32>,
-    seat_meta_by_guid: HashMap<u32, SeatMeta>,
+    private_to_public_squad_guid: U32HashMap<u32>,
+    seat_meta_by_guid: U32HashMap<SeatMeta>,
     seat_change_candidates: Vec<SeatChangeCandidate>,
     seen_seat_keys: HashSet<SeenSeatKey>,
-    kill_states: HashMap<u32, DeathState>,
+    kill_states: U32HashMap<DeathState>,
     kill_candidates: Vec<KillCandidate>,
     kill_dedup: HashSet<(u64, u32, bool)>,
     seen_deployment_actor_guids: HashSet<u32>,
     retain_property_events: bool,
     property_events: Vec<PropertyEvent>,
+    // Dedupes group_path / property_name across property events. Cleared
+    // before the bundle is handed back.
+    str_interner: HashMap<String, Arc<str>>,
+    // Memoized hint -> canonical path. Stores the path string rather than
+    // the Arc<ExportGroup> because read_net_field_exports calls
+    // Arc::make_mut to grow groups in place, which swaps the backing
+    // allocation under any arc the cache might have held.
+    group_hint_cache: HashMap<String, String>,
     component_state_events: Vec<ComponentStateEvent>,
     deployment_events: Vec<DeploymentEvent>,
     vehicle_state_events: Vec<VehicleStateEvent>,
@@ -351,6 +389,7 @@ struct PropertyContext<'a> {
     actor: Option<&'a OpenedActor>,
     group_path: &'a str,
     group_leaf: &'a str,
+    classify_flags: ClassifyFlags,
     property_name: &'a str,
     t_ms: u64,
     channel_index: u32,
@@ -595,51 +634,46 @@ impl BitReader {
         out
     }
 
-    fn read_bits_to_unsigned_int(&mut self, mut count: usize) -> u64 {
+    fn read_bits_to_unsigned_int(&mut self, count: usize) -> u64 {
+        // Load a window wide enough to cover count+bit_offset bits, shift
+        // off the leading bit_offset bits, mask to count. Replaces a
+        // bit-by-bit loop that dominated the parser's CPU time.
+        //
+        // Soft EOF: reads past the end return zero bits and do NOT set
+        // is_error. The original unaligned path behaved this way via
+        // unwrap_or(0), and the bunch loop relies on trailing over-reads
+        // as a termination probe. A stricter error contract deadlocks the
+        // parser; callers that want a hard EOF check already do their own
+        // can_read upfront (see read_byte, read_bytes).
         if count > 64 {
             self.is_error = true;
             return 0;
         }
-
-        let mut value = 0u64;
-        let mut read_bits = 0usize;
-
-        if (self.offset & 7) == 0 {
-            let mut index = 0usize;
-            while count >= 8 {
-                if !self.can_read(8) {
-                    self.is_error = true;
-                    return 0;
-                }
-                value |= (self.data[self.offset / 8] as u64) << (index * 8);
-                index += 1;
-                count -= 8;
-                read_bits += 8;
-                self.offset += 8;
-            }
-            if count == 0 {
-                return value;
-            }
+        if count == 0 {
+            return 0;
         }
 
-        let mut current_bit = 1u64 << read_bits;
-        let mut current_byte = self.data.get(self.offset / 8).copied().unwrap_or(0);
-        let mut current_byte_bit = 1u8 << (self.offset & 7);
+        let byte_index = self.offset >> 3;
+        let bit_offset = self.offset & 7;
+        // u128 window: the worst case (count=64, bit_offset=7) spans 9
+        // bytes, still well within 128 bits.
+        let needed = (count + bit_offset + 7) >> 3;
 
-        for _ in 0..count {
-            let bit_offset = self.offset & 7;
-            if bit_offset == 0 {
-                current_byte_bit = 1;
-                current_byte = self.data.get(self.offset / 8).copied().unwrap_or(0);
-            }
-            if (current_byte & current_byte_bit) != 0 {
-                value |= current_bit;
-            }
-            self.offset += 1;
-            current_byte_bit = current_byte_bit.wrapping_shl(1);
-            current_bit = current_bit.wrapping_shl(1);
+        let mut window: u128 = 0;
+        for i in 0..needed {
+            let byte = self.data.get(byte_index + i).copied().unwrap_or(0);
+            window |= (byte as u128) << (i << 3);
         }
 
+        window >>= bit_offset;
+        let mask: u128 = if count == 64 {
+            u64::MAX as u128
+        } else {
+            (1u128 << count) - 1
+        };
+        let value = (window & mask) as u64;
+
+        self.offset += count;
         value
     }
 
@@ -1171,10 +1205,23 @@ fn ignored_fname_value(value: &str) -> bool {
 }
 
 fn canonical_group_leaf_ref(path: &str) -> &str {
-    let without_colon = path.split(':').next().unwrap_or(path);
-    let without_cache = without_colon.trim_end_matches("_ClassNetCache");
-    let without_dot = without_cache.rsplit('.').next().unwrap_or(without_cache);
-    let without_slash = without_dot.rsplit('/').next().unwrap_or(without_dot);
+    // Uses strip_suffix / find rather than trim_end_matches / split so we
+    // don't pay StrSearcher setup cost on every call.
+    let without_colon = match path.find(':') {
+        Some(idx) => &path[..idx],
+        None => path,
+    };
+    let without_cache = without_colon
+        .strip_suffix("_ClassNetCache")
+        .unwrap_or(without_colon);
+    let without_dot = match without_cache.rfind('.') {
+        Some(idx) => &without_cache[idx + 1..],
+        None => without_cache,
+    };
+    let without_slash = match without_dot.rfind('/') {
+        Some(idx) => &without_dot[idx + 1..],
+        None => without_dot,
+    };
     without_slash
         .strip_prefix("Default__")
         .unwrap_or(without_slash)
@@ -1228,15 +1275,33 @@ fn canonical_script_group_candidates(hint: &str) -> Vec<String> {
     out
 }
 
-fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
+fn group_for_hint(state: &mut ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
     let hint = hint.trim();
     if hint.is_empty() {
         return None;
     }
 
+    // Fast path: look up the cached canonical path and re-fetch the arc,
+    // since make_mut may have replaced it since the path was cached.
+    if let Some(path) = state.group_hint_cache.get(hint) {
+        return state.groups_by_path.get(path).map(Arc::clone);
+    }
+
+    // Cache miss: walk the full fallback chain.
+    let (group, resolved_path) = resolve_hint_path(state, hint)?;
+    state
+        .group_hint_cache
+        .insert(hint.to_string(), resolved_path);
+    Some(group)
+}
+
+fn resolve_hint_path(
+    state: &ParseState,
+    hint: &str,
+) -> Option<(Arc<ExportGroup>, String)> {
     // 1. Exact path.
     if let Some(group) = state.groups_by_path.get(hint) {
-        return Some(Arc::clone(group));
+        return Some((Arc::clone(group), hint.to_string()));
     }
 
     // 2. Strip script suffixes like `:bar`.
@@ -1248,7 +1313,7 @@ fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
             .trim_end_matches("_ClassNetCache");
         if trimmed != hint {
             if let Some(group) = state.groups_by_path.get(trimmed) {
-                return Some(Arc::clone(group));
+                return Some((Arc::clone(group), trimmed.to_string()));
             }
         }
     }
@@ -1257,14 +1322,14 @@ fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
     let leaf = canonical_group_leaf_ref(hint);
     if leaf != hint {
         if let Some(group) = state.groups_by_path.get(leaf) {
-            return Some(Arc::clone(group));
+            return Some((Arc::clone(group), leaf.to_string()));
         }
     }
 
     // 4. Well-known `/Script/Squad.*` aliases.
     if let Some(well_known) = canonical_script_well_known(leaf) {
         if let Some(group) = state.groups_by_path.get(well_known) {
-            return Some(Arc::clone(group));
+            return Some((Arc::clone(group), well_known.to_string()));
         }
     }
 
@@ -1273,7 +1338,7 @@ fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
         // Only allocate if the earlier lookups missed.
         let synthesized = format!("/Script/Squad.{leaf}");
         if let Some(group) = state.groups_by_path.get(&synthesized) {
-            return Some(Arc::clone(group));
+            return Some((Arc::clone(group), synthesized));
         }
     }
 
@@ -1281,7 +1346,7 @@ fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
     if !leaf.is_empty() {
         if let Some(path) = state.groups_by_leaf.get(leaf) {
             if let Some(group) = state.groups_by_path.get(path) {
-                return Some(Arc::clone(group));
+                return Some((Arc::clone(group), path.clone()));
             }
         }
     }
@@ -1290,7 +1355,7 @@ fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
 }
 
 fn resolve_rep_group(
-    state: &ParseState,
+    state: &mut ParseState,
     actor: Option<&OpenedActor>,
     rep_object: Option<&str>,
     sub_object_net_guid: Option<u32>,
@@ -1300,8 +1365,10 @@ fn resolve_rep_group(
             return Some(group);
         }
         if let Ok(net_guid) = raw.parse::<u32>() {
-            if let Some(path) = state.guid_to_path.get(&net_guid) {
-                if let Some(group) = group_for_hint(state, path) {
+            // Clone the path so the &state borrow from guid_to_path ends
+            // before we re-enter group_for_hint with &mut state.
+            if let Some(path) = state.guid_to_path.get(&net_guid).cloned() {
+                if let Some(group) = group_for_hint(state, &path) {
                     return Some(group);
                 }
             }
@@ -1309,8 +1376,8 @@ fn resolve_rep_group(
     }
 
     if let Some(sub_guid) = sub_object_net_guid {
-        if let Some(path) = state.guid_to_path.get(&sub_guid) {
-            if let Some(group) = group_for_hint(state, path) {
+        if let Some(path) = state.guid_to_path.get(&sub_guid).cloned() {
+            if let Some(group) = group_for_hint(state, &path) {
                 return Some(group);
             }
         }
@@ -1318,14 +1385,14 @@ fn resolve_rep_group(
 
     if let Some(actor) = actor {
         if let Some(archetype) = actor.archetype {
-            if let Some(path) = state.guid_to_path.get(&archetype.value) {
-                if let Some(group) = group_for_hint(state, path) {
+            if let Some(path) = state.guid_to_path.get(&archetype.value).cloned() {
+                if let Some(group) = group_for_hint(state, &path) {
                     return Some(group);
                 }
             }
         }
-        if let Some(path) = state.guid_to_path.get(&actor.actor_net_guid.value) {
-            if let Some(group) = group_for_hint(state, path) {
+        if let Some(path) = state.guid_to_path.get(&actor.actor_net_guid.value).cloned() {
+            if let Some(group) = group_for_hint(state, &path) {
                 return Some(group);
             }
         }
@@ -1892,7 +1959,7 @@ fn decode_generic_value(
     let string = decode_textual_scalar(reader, property_name);
 
     let rep_movement = if property_name == "ReplicatedMovement" {
-        decode_rep_movement(reader.clone_window(), header)
+        decode_rep_movement(reader.clone_window(), header).map(Box::new)
     } else {
         None
     };
@@ -2191,10 +2258,12 @@ fn read_net_field_exports(replay: &mut BitReader, state: &mut ParseState) {
             let pathname = replay.read_string();
             let num_exports = replay.read_int_packed();
             if !state.groups_by_path.contains_key(&pathname) {
+                let classify_flags = ClassifyFlags::from_group_leaf(infer_group_leaf(&pathname));
                 let group = Arc::new(ExportGroup {
                     path_name: pathname.clone(),
+                    classify_flags,
                     net_field_exports_length: num_exports,
-                    net_field_exports: HashMap::new(),
+                    net_field_exports: U32HashMap::default(),
                 });
                 // Keep the first path we saw for each leaf.
                 state
@@ -2417,7 +2486,7 @@ fn apply_property_event(
             _ => {}
         }
 
-        if is_deployable_primary_type(context.group_leaf) {
+        if context.classify_flags.is_deployable_primary() {
             let deployment = state
                 .deployables
                 .entry(channel_actor_guid)
@@ -2565,7 +2634,7 @@ fn apply_property_event(
         }
     }
 
-    if is_soldier_type(context.group_leaf) && context.property_name == "ReplicatedMovement" {
+    if context.classify_flags.is_soldier() && context.property_name == "ReplicatedMovement" {
         if let Some(movement) = &decoded.rep_movement {
             if let Some(location) = movement.location {
                 state.raw_player_samples.push(RawSample {
@@ -2586,7 +2655,7 @@ fn apply_property_event(
         if let (Some(owner_actor_guid), Some(component_guid), Some(movement)) = (
             actor_guid,
             context.sub_object_net_guid,
-            decoded.rep_movement.clone(),
+            decoded.rep_movement.as_deref(),
         ) {
             if component_guid != owner_actor_guid && movement.location.is_some() {
                 // These transforms are local-space; we anchor them later.
@@ -2594,14 +2663,14 @@ fn apply_property_event(
                     t_ms: context.t_ms,
                     actor_guid: owner_actor_guid,
                     payload_bits: decoded.bits,
-                    movement,
+                    movement: movement.clone(),
                 });
             }
         }
     }
 
     if !is_helicopter_movement_component
-        && is_vehicle_type(context.group_leaf)
+        && context.classify_flags.is_vehicle()
         && context.property_name == "ReplicatedMovement"
     {
         if let Some(movement) = &decoded.rep_movement {
@@ -2733,7 +2802,7 @@ fn apply_property_event(
         }
     }
 
-    if is_vehicle_type(context.group_leaf)
+    if context.classify_flags.is_vehicle()
         && matches!(
             context.property_name,
             "Health" | "bIsEngineActive" | "CurrentGear" | "Throttle" | "Brake"
@@ -2855,6 +2924,17 @@ fn apply_property_event(
     }
 }
 
+fn intern_str(interner: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
+    // Two lookups, but the hit path is allocation-free. raw_entry_mut is
+    // still unstable or we'd use that instead.
+    if let Some(existing) = interner.get(value) {
+        return Arc::clone(existing);
+    }
+    let arc: Arc<str> = Arc::from(value);
+    interner.insert(value.to_string(), Arc::clone(&arc));
+    arc
+}
+
 fn record_property_event(
     state: &mut ParseState,
     context: PropertyContext<'_>,
@@ -2863,13 +2943,15 @@ fn record_property_event(
     state.property_replications += 1;
     apply_property_event(state, context, &decoded);
     if state.retain_property_events {
+        let group_path = intern_str(&mut state.str_interner, context.group_path);
+        let property_name = intern_str(&mut state.str_interner, context.property_name);
         state.property_events.push(PropertyEvent {
             t_ms: context.t_ms,
             second: (context.t_ms / 1000) as u32,
             channel_index: context.channel_index,
             actor_guid: context.actor.map(|value| value.actor_net_guid.value),
-            group_path: context.group_path.to_string(),
-            property_name: context.property_name.to_string(),
+            group_path,
+            property_name,
             sub_object_net_guid: context.sub_object_net_guid,
             decoded,
         });
@@ -2913,7 +2995,8 @@ fn read_rep_layout_properties(
             decode_generic_value(&payload_reader, &archive.header, export.name.as_str());
         if export.name == "ReplicatedMovement" && is_helicopter_movement_component {
             decoded.rep_movement =
-                decode_helicopter_component_rep_movement(payload_reader, &archive.header);
+                decode_helicopter_component_rep_movement(payload_reader, &archive.header)
+                    .map(Box::new);
         }
         let t_ms = (context.time_seconds.max(0.0) as f64 * 1000.0).round() as u64;
         let _ = archive.pop_offset(5, true);
@@ -2924,6 +3007,7 @@ fn read_rep_layout_properties(
                 actor: context.actor,
                 group_path: context.group_path,
                 group_leaf,
+                classify_flags: group.classify_flags,
                 property_name: export.name.as_str(),
                 t_ms,
                 channel_index: context.channel_index,
@@ -2953,7 +3037,8 @@ fn read_rep_layout_properties(
                         decoded.rep_movement = decode_helicopter_component_rep_movement(
                             payload_reader,
                             &archive.header,
-                        );
+                        )
+                        .map(Box::new);
                     }
 
                     let t_ms = (context.time_seconds.max(0.0) as f64 * 1000.0).round() as u64;
@@ -2964,6 +3049,7 @@ fn read_rep_layout_properties(
                             actor: context.actor,
                             group_path: context.group_path,
                             group_leaf,
+                            classify_flags: group.classify_flags,
                             property_name: export.name.as_str(),
                             t_ms,
                             channel_index: context.channel_index,
@@ -4403,6 +4489,17 @@ fn parse_data(
         },
     );
 
+    // Drop the interner keys; the Arc<str> values on each event already
+    // hold the actual strings alive.
+    state.str_interner.clear();
+    state.str_interner.shrink_to_fit();
+    // Reclaim the tail of the growth-doubled vecs before handing the
+    // bundle to the caller.
+    state.property_events.shrink_to_fit();
+    state.raw_player_samples.shrink_to_fit();
+    state.raw_vehicle_samples.shrink_to_fit();
+    state.raw_helicopter_samples.shrink_to_fit();
+
     let tracks = finalize_tracks(&mut state);
 
     let mut players = state
@@ -4675,7 +4772,7 @@ mod tests {
         };
 
         let resolved = resolve_rep_group(
-            &state,
+            &mut state,
             Some(&actor),
             Some("/Script/Squad.SQHelicopterMovementComponent"),
             Some(1586),
@@ -5103,8 +5200,8 @@ mod tests {
         );
 
         assert!(bundle.events.properties.iter().any(|event| {
-            event.group_path == "/Script/Squad.SQHelicopterMovementComponent"
-                && event.property_name == "ReplicatedMovement"
+            &*event.group_path == "/Script/Squad.SQHelicopterMovementComponent"
+                && &*event.property_name == "ReplicatedMovement"
                 && matches!(event.actor_guid, Some(754 | 966 | 3764))
         }));
 

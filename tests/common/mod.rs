@@ -428,8 +428,8 @@ pub fn sample_bundle() -> Bundle {
                 second: 0,
                 channel_index: 1,
                 actor_guid: Some(754),
-                group_path: "/Script/Squad.SQRotorComponent".to_string(),
-                property_name: "Health".to_string(),
+                group_path: "/Script/Squad.SQRotorComponent".into(),
+                property_name: "Health".into(),
                 sub_object_net_guid: Some(3334),
                 decoded: DecodedPropertyValue {
                     bits: 32,

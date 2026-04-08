@@ -1,3 +1,56 @@
+/// Cached classification bitmask for an export group's class name.
+///
+/// The `is_*` helpers below do naive substring scans. They get called on
+/// every property event, but only a few dozen unique class names exist per
+/// replay, so we run them once per `ExportGroup` and cache the result here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassifyFlags(pub u8);
+
+impl ClassifyFlags {
+    pub const SOLDIER: u8 = 1 << 0;
+    pub const VEHICLE: u8 = 1 << 1;
+    pub const HELICOPTER: u8 = 1 << 2;
+    pub const DEPLOYABLE_PRIMARY: u8 = 1 << 3;
+
+    pub fn from_group_leaf(leaf: &str) -> Self {
+        let mut bits = 0u8;
+        if is_soldier_type(leaf) {
+            bits |= Self::SOLDIER;
+        }
+        if is_helicopter_type(leaf) {
+            bits |= Self::HELICOPTER;
+        }
+        if is_vehicle_type(leaf) {
+            bits |= Self::VEHICLE;
+        }
+        if is_deployable_primary_type(leaf) {
+            bits |= Self::DEPLOYABLE_PRIMARY;
+        }
+        Self(bits)
+    }
+
+    #[inline]
+    pub fn is_soldier(self) -> bool {
+        self.0 & Self::SOLDIER != 0
+    }
+
+    #[inline]
+    pub fn is_vehicle(self) -> bool {
+        self.0 & Self::VEHICLE != 0
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_helicopter(self) -> bool {
+        self.0 & Self::HELICOPTER != 0
+    }
+
+    #[inline]
+    pub fn is_deployable_primary(self) -> bool {
+        self.0 & Self::DEPLOYABLE_PRIMARY != 0
+    }
+}
+
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     let haystack = haystack.as_bytes();
     let needle = needle.as_bytes();

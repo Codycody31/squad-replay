@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInfo {
@@ -135,7 +136,9 @@ pub struct DecodedPropertyValue {
     pub float32: Option<f32>,
     pub boolean: Option<bool>,
     pub string: Option<String>,
-    pub rep_movement: Option<RepMovement>,
+    // Boxed because RepMovement is ~150 bytes but most events don't carry
+    // movement data. Inlining it roughly doubled PropertyEvent for no gain.
+    pub rep_movement: Option<Box<RepMovement>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -144,8 +147,11 @@ pub struct PropertyEvent {
     pub second: u32,
     pub channel_index: u32,
     pub actor_guid: Option<u32>,
-    pub group_path: String,
-    pub property_name: String,
+    // Very low cardinality across a replay (a few dozen unique values for
+    // millions of events). Arc<str> lets them share backing storage via the
+    // interner on ParseState.
+    pub group_path: Arc<str>,
+    pub property_name: Arc<str>,
     pub sub_object_net_guid: Option<u32>,
     pub decoded: DecodedPropertyValue,
 }

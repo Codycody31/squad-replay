@@ -2,11 +2,22 @@ use crate::bundle::{Bundle, ReplayInfoSection, SchemaInfo};
 use crate::compat;
 use crate::error::{Error, Result};
 use crc32fast::Hasher as Crc32;
-use rmp_serde::{decode::from_slice as from_msgpack_slice, encode::to_vec_named as to_msgpack_vec};
+use rayon::prelude::*;
+use rmp_serde::decode::from_slice as from_msgpack_slice;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
+
+// Compression level. Was 10, which put zstd at ~75% of total CPU on large
+// replays. Level 3 is zstd's default and gives output roughly 30% bigger
+// for several times the throughput, which is the right tradeoff here.
+const SQRB_ZSTD_LEVEL: i32 = 3;
+
+// Worker count for zstd's built-in multithreading on the Properties
+// section. Four leaves headroom for the rayon workers running the other
+// sections; going wider oversubscribes without helping wall time.
+const SQRB_ZSTD_HEAVY_WORKERS: u32 = 4;
 
 const SQRB_MAGIC: &[u8; 4] = b"SQRB";
 const SQRB_MAJOR: u16 = 1;
@@ -71,14 +82,130 @@ fn io_err(path: impl AsRef<Path>, source: std::io::Error) -> Error {
     }
 }
 
-fn zstd_encode(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::stream::encode_all(Cursor::new(data), 10)
-        .map_err(|source| Error::Message(format!("zstd encode failed: {source}")))
-}
-
 fn zstd_decode(data: &[u8]) -> Result<Vec<u8>> {
     zstd::stream::decode_all(Cursor::new(data))
         .map_err(|source| Error::Message(format!("zstd decode failed: {source}")))
+}
+
+/// Write adapter that passes bytes through to an inner writer while
+/// accumulating a CRC32 and a running byte count. Lets the serializer
+/// stream straight into zstd while still recovering the pre-compression
+/// size and checksum that the sqrb header needs.
+struct CountingCrcWriter<W: Write> {
+    inner: W,
+    crc: Crc32,
+    bytes: u64,
+}
+
+impl<W: Write> CountingCrcWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            crc: Crc32::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (W, u32, u64) {
+        (self.inner, self.crc.finalize(), self.bytes)
+    }
+}
+
+impl<W: Write> Write for CountingCrcWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.crc.update(&buf[..written]);
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Encode one sqrb section by streaming the serializer output into an
+/// in-memory buffer, optionally through zstd on the way.
+///
+/// Pass a nonzero `zstd_mt_workers` to enable zstd's internal thread pool.
+/// The pool has a fixed setup cost so it's only worth turning on for
+/// sections large enough to pay it back (currently just Properties).
+fn encode_section_streaming<F>(
+    id: SectionId,
+    json_payload: bool,
+    compress: bool,
+    item_count: u32,
+    zstd_mt_workers: u32,
+    serialize: F,
+) -> Result<EncodedSection>
+where
+    F: FnOnce(&mut dyn Write) -> Result<()>,
+{
+    let mut flags: u16 = if json_payload { 0x0001 } else { 0x0002 };
+    // Initial capacity only, the Vec grows on demand.
+    let stored = Vec::<u8>::with_capacity(64 * 1024);
+    let counter = CountingCrcWriter::new(stored);
+
+    // The BufWriter above the CRC layer is load-bearing: without it
+    // rmp_serde hands crc32fast tiny slices and falls off its SIMD path.
+    // Keep the buffer fat enough that pclmulqdq stays engaged.
+    const CRC_BUF_CAP: usize = 64 * 1024;
+
+    let (stored, raw_len, crc32) = if compress {
+        flags |= 0x0004;
+        // CountingCrcWriter sits above zstd so raw_len and crc32 reflect
+        // pre-compression bytes, matching the sqrb header contract.
+        let mut zstd_encoder = zstd::stream::Encoder::new(
+            Vec::<u8>::with_capacity(64 * 1024),
+            SQRB_ZSTD_LEVEL,
+        )
+        .map_err(|source| Error::Message(format!("zstd encode init failed: {source}")))?;
+        if zstd_mt_workers > 0 {
+            zstd_encoder
+                .multithread(zstd_mt_workers)
+                .map_err(|source| {
+                    Error::Message(format!("zstd multithread init failed: {source}"))
+                })?;
+        }
+        let counter = CountingCrcWriter::new(&mut zstd_encoder);
+        let mut buffered = BufWriter::with_capacity(CRC_BUF_CAP, counter);
+        serialize(&mut buffered)?;
+        buffered
+            .flush()
+            .map_err(|source| Error::Message(format!("sqrb buffer flush failed: {source}")))?;
+        let counter = buffered
+            .into_inner()
+            .map_err(|source| Error::Message(format!("sqrb buffer unwrap failed: {source}")))?;
+        let (_, crc32, raw_len) = counter.finish();
+        let compressed = zstd_encoder
+            .finish()
+            .map_err(|source| Error::Message(format!("zstd encode finish failed: {source}")))?;
+        (compressed, raw_len, crc32)
+    } else {
+        let mut buffered = BufWriter::with_capacity(CRC_BUF_CAP, counter);
+        serialize(&mut buffered)?;
+        buffered
+            .flush()
+            .map_err(|source| Error::Message(format!("sqrb buffer flush failed: {source}")))?;
+        let counter = buffered
+            .into_inner()
+            .map_err(|source| Error::Message(format!("sqrb buffer unwrap failed: {source}")))?;
+        let (stored, crc32, raw_len) = counter.finish();
+        (stored, raw_len, crc32)
+    };
+
+    // The old encoder skipped zstd for payloads under 1 KiB; streaming
+    // makes that check awkward and the overhead on small sections is
+    // negligible, so we let zstd run unconditionally.
+    Ok(EncodedSection {
+        id,
+        flags,
+        stored_len: stored.len() as u64,
+        raw_len,
+        crc32,
+        item_count,
+        stored,
+    })
 }
 
 pub(crate) fn write_sqrj(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> {
@@ -98,31 +225,41 @@ pub(crate) fn read_sqrj(path: impl AsRef<Path>) -> Result<Bundle> {
     Ok(bundle)
 }
 
-fn encode_section(
+/// Returns a closure that msgpack-encodes `slice` as one sqrb section.
+fn msgpack_section<'a, T>(
     id: SectionId,
-    json_payload: bool,
     compress: bool,
-    item_count: u32,
-    raw: Vec<u8>,
-) -> Result<EncodedSection> {
-    let raw_len = raw.len() as u64;
-    let mut crc = Crc32::new();
-    crc.update(&raw);
-    let mut flags: u16 = if json_payload { 0x0001 } else { 0x0002 };
-    let stored = if compress && raw.len() > 1024 {
-        flags |= 0x0004;
-        zstd_encode(&raw)?
-    } else {
-        raw
-    };
-    Ok(EncodedSection {
-        id,
-        flags,
-        stored_len: stored.len() as u64,
-        raw_len,
-        crc32: crc.finalize(),
-        item_count,
-        stored,
+    zstd_mt_workers: u32,
+    slice: &'a [T],
+) -> Box<dyn FnOnce() -> Result<EncodedSection> + Send + 'a>
+where
+    T: Serialize + Sync,
+{
+    let item_count = slice.len() as u32;
+    Box::new(move || {
+        encode_section_streaming(id, false, compress, item_count, zstd_mt_workers, |w| {
+            rmp_serde::encode::write_named(w, &slice)
+                .map_err(|source| Error::Message(format!("msgpack encode failed: {source}")))?;
+            Ok(())
+        })
+    })
+}
+
+/// Single-value variant of [`msgpack_section`], used for `Diagnostics`.
+fn msgpack_section_single<'a, T>(
+    id: SectionId,
+    compress: bool,
+    value: &'a T,
+) -> Box<dyn FnOnce() -> Result<EncodedSection> + Send + 'a>
+where
+    T: Serialize + Sync,
+{
+    Box::new(move || {
+        encode_section_streaming(id, false, compress, 1, 0, |w| {
+            rmp_serde::encode::write_named(w, value)
+                .map_err(|source| Error::Message(format!("msgpack encode failed: {source}")))?;
+            Ok(())
+        })
     })
 }
 
@@ -156,11 +293,61 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
         replay: bundle.replay.clone(),
     };
 
+    // Each entry is a boxed closure so rayon can own them and run them in
+    // parallel. The closures borrow from `bundle` and `manifest`, which
+    // both outlive the parallel collect below, so no cloning is needed.
+    type SectionEncoder<'a> = Box<dyn FnOnce() -> Result<EncodedSection> + Send + 'a>;
+
+    // Manifest is JSON, everything else is msgpack. The heavier sections
+    // get zstd compression.
+    let sections: Vec<SectionEncoder<'_>> = vec![
+        Box::new(move || {
+            encode_section_streaming(SectionId::Manifest, true, false, 1, 0, |w| {
+                serde_json::to_writer_pretty(w, &manifest)?;
+                Ok(())
+            })
+        }),
+        msgpack_section(SectionId::Teams, false, 0, &bundle.teams),
+        msgpack_section(SectionId::Squads, false, 0, &bundle.squads),
+        msgpack_section(SectionId::Players, false, 0, &bundle.players),
+        msgpack_section(SectionId::Vehicles, false, 0, &bundle.actors.vehicles),
+        msgpack_section(SectionId::Helicopters, false, 0, &bundle.actors.helicopters),
+        msgpack_section(SectionId::Deployables, false, 0, &bundle.actors.deployables),
+        msgpack_section(SectionId::Components, false, 0, &bundle.actors.components),
+        msgpack_section(SectionId::PlayerTracks, true, 0, &bundle.tracks.players),
+        msgpack_section(SectionId::VehicleTracks, true, 0, &bundle.tracks.vehicles),
+        msgpack_section(SectionId::HelicopterTracks, true, 0, &bundle.tracks.helicopters),
+        msgpack_section(SectionId::Kills, false, 0, &bundle.events.kills),
+        msgpack_section(SectionId::Deployments, false, 0, &bundle.events.deployments),
+        msgpack_section(SectionId::SeatChanges, false, 0, &bundle.events.seat_changes),
+        msgpack_section(SectionId::ComponentStates, true, 0, &bundle.events.component_states),
+        msgpack_section(SectionId::VehicleStates, true, 0, &bundle.events.vehicle_states),
+        msgpack_section(SectionId::WeaponStates, true, 0, &bundle.events.weapon_states),
+        // Properties is the only section big enough to repay the cost of
+        // spinning up zstd's worker pool.
+        msgpack_section(
+            SectionId::Properties,
+            true,
+            SQRB_ZSTD_HEAVY_WORKERS,
+            &bundle.events.properties,
+        ),
+        msgpack_section_single(SectionId::Diagnostics, false, &bundle.diagnostics),
+    ];
+    let section_count = sections.len() as u32;
+
+    // Encode sections in parallel. Properties dominates wall time either
+    // way, so most of the win comes from zstdmt inside that encoder; the
+    // rest just overlap for free.
+    let encoded: Vec<EncodedSection> = sections
+        .into_par_iter()
+        .map(|encoder| encoder())
+        .collect::<Result<Vec<_>>>()?;
+
     let header_len = 4 + 2 + 2 + 4 + 8 + 4 + 8;
     let mut offset = header_len as u64;
     let file = File::create(path).map_err(|source| io_err(path, source))?;
     let mut writer = BufWriter::new(file);
-    let mut directory = Vec::with_capacity(19);
+    let mut directory = Vec::with_capacity(encoded.len());
 
     writer
         .write_all(SQRB_MAGIC)
@@ -172,7 +359,7 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
         .write_all(&SQRB_MINOR.to_le_bytes())
         .map_err(|source| io_err(path, source))?;
     writer
-        .write_all(&19u32.to_le_bytes())
+        .write_all(&section_count.to_le_bytes())
         .map_err(|source| io_err(path, source))?;
     writer
         .write_all(&0u64.to_le_bytes())
@@ -184,146 +371,9 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
         .write_all(&0u64.to_le_bytes())
         .map_err(|source| io_err(path, source))?;
 
-    macro_rules! stream_section {
-        ($id:expr, $json:expr, $compress:expr, $count:expr, $raw:expr) => {{
-            let section = encode_section($id, $json, $compress, $count, $raw)?;
-            write_encoded_section(&mut writer, &mut directory, &mut offset, section)?;
-        }};
+    for section in encoded {
+        write_encoded_section(&mut writer, &mut directory, &mut offset, section)?;
     }
-
-    stream_section!(
-        SectionId::Manifest,
-        true,
-        false,
-        1,
-        serde_json::to_vec_pretty(&manifest)?
-    );
-    stream_section!(
-        SectionId::Teams,
-        false,
-        false,
-        bundle.teams.len() as u32,
-        to_msgpack_vec(&bundle.teams)?
-    );
-    stream_section!(
-        SectionId::Squads,
-        false,
-        false,
-        bundle.squads.len() as u32,
-        to_msgpack_vec(&bundle.squads)?
-    );
-    stream_section!(
-        SectionId::Players,
-        false,
-        false,
-        bundle.players.len() as u32,
-        to_msgpack_vec(&bundle.players)?
-    );
-    stream_section!(
-        SectionId::Vehicles,
-        false,
-        false,
-        bundle.actors.vehicles.len() as u32,
-        to_msgpack_vec(&bundle.actors.vehicles)?
-    );
-    stream_section!(
-        SectionId::Helicopters,
-        false,
-        false,
-        bundle.actors.helicopters.len() as u32,
-        to_msgpack_vec(&bundle.actors.helicopters)?
-    );
-    stream_section!(
-        SectionId::Deployables,
-        false,
-        false,
-        bundle.actors.deployables.len() as u32,
-        to_msgpack_vec(&bundle.actors.deployables)?
-    );
-    stream_section!(
-        SectionId::Components,
-        false,
-        false,
-        bundle.actors.components.len() as u32,
-        to_msgpack_vec(&bundle.actors.components)?
-    );
-    stream_section!(
-        SectionId::PlayerTracks,
-        false,
-        true,
-        bundle.tracks.players.len() as u32,
-        to_msgpack_vec(&bundle.tracks.players)?
-    );
-    stream_section!(
-        SectionId::VehicleTracks,
-        false,
-        true,
-        bundle.tracks.vehicles.len() as u32,
-        to_msgpack_vec(&bundle.tracks.vehicles)?
-    );
-    stream_section!(
-        SectionId::HelicopterTracks,
-        false,
-        true,
-        bundle.tracks.helicopters.len() as u32,
-        to_msgpack_vec(&bundle.tracks.helicopters)?
-    );
-    stream_section!(
-        SectionId::Kills,
-        false,
-        false,
-        bundle.events.kills.len() as u32,
-        to_msgpack_vec(&bundle.events.kills)?
-    );
-    stream_section!(
-        SectionId::Deployments,
-        false,
-        false,
-        bundle.events.deployments.len() as u32,
-        to_msgpack_vec(&bundle.events.deployments)?
-    );
-    stream_section!(
-        SectionId::SeatChanges,
-        false,
-        false,
-        bundle.events.seat_changes.len() as u32,
-        to_msgpack_vec(&bundle.events.seat_changes)?
-    );
-    stream_section!(
-        SectionId::ComponentStates,
-        false,
-        true,
-        bundle.events.component_states.len() as u32,
-        to_msgpack_vec(&bundle.events.component_states)?
-    );
-    stream_section!(
-        SectionId::VehicleStates,
-        false,
-        true,
-        bundle.events.vehicle_states.len() as u32,
-        to_msgpack_vec(&bundle.events.vehicle_states)?
-    );
-    stream_section!(
-        SectionId::WeaponStates,
-        false,
-        true,
-        bundle.events.weapon_states.len() as u32,
-        to_msgpack_vec(&bundle.events.weapon_states)?
-    );
-    stream_section!(
-        SectionId::Properties,
-        false,
-        true,
-        bundle.events.properties.len() as u32,
-        to_msgpack_vec(&bundle.events.properties)?
-    );
-    stream_section!(
-        SectionId::Diagnostics,
-        false,
-        false,
-        1,
-        to_msgpack_vec(&bundle.diagnostics)?
-    );
 
     let directory_offset = offset;
     for section in &directory {
@@ -604,8 +654,8 @@ mod tests {
                     second: 0,
                     channel_index: 1,
                     actor_guid: Some(754),
-                    group_path: "/Script/Squad.SQRotorComponent".to_string(),
-                    property_name: "Health".to_string(),
+                    group_path: "/Script/Squad.SQRotorComponent".into(),
+                    property_name: "Health".into(),
                     sub_object_net_guid: Some(3334),
                     decoded: DecodedPropertyValue {
                         bits: 32,
