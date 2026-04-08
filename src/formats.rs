@@ -4,12 +4,12 @@ use crate::error::{Error, Result};
 use crc32fast::Hasher as Crc32;
 use rmp_serde::{decode::from_slice as from_msgpack_slice, encode::to_vec_named as to_msgpack_vec};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const SQRB_MAGIC: &[u8; 4] = b"SQRB";
-const SQRB_MAJOR: u16 = 2;
+const SQRB_MAJOR: u16 = 1;
 const SQRB_MINOR: u16 = 0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,12 +46,22 @@ enum SectionId {
 struct EncodedSection {
     id: SectionId,
     flags: u16,
-    offset: u64,
     stored_len: u64,
     raw_len: u64,
     crc32: u32,
     item_count: u32,
     stored: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct SectionDirectoryEntry {
+    id: SectionId,
+    flags: u16,
+    offset: u64,
+    stored_len: u64,
+    raw_len: u64,
+    crc32: u32,
+    item_count: u32,
 }
 
 fn io_err(path: impl AsRef<Path>, source: std::io::Error) -> Error {
@@ -73,8 +83,12 @@ fn zstd_decode(data: &[u8]) -> Result<Vec<u8>> {
 
 pub(crate) fn write_sqrj(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    let bytes = serde_json::to_vec(bundle)?;
-    fs::write(path, bytes).map_err(|source| io_err(path, source))
+    let file = File::create(path).map_err(|source| io_err(path, source))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, bundle)?;
+    // Flush explicitly so write errors do not get lost on drop.
+    writer.flush().map_err(|source| io_err(path, source))?;
+    Ok(())
 }
 
 pub(crate) fn read_sqrj(path: impl AsRef<Path>) -> Result<Bundle> {
@@ -92,25 +106,46 @@ fn encode_section(
     raw: Vec<u8>,
 ) -> Result<EncodedSection> {
     let raw_len = raw.len() as u64;
+    let mut crc = Crc32::new();
+    crc.update(&raw);
     let mut flags: u16 = if json_payload { 0x0001 } else { 0x0002 };
     let stored = if compress && raw.len() > 1024 {
         flags |= 0x0004;
         zstd_encode(&raw)?
     } else {
-        raw.clone()
+        raw
     };
-    let mut crc = Crc32::new();
-    crc.update(&raw);
     Ok(EncodedSection {
         id,
         flags,
-        offset: 0,
         stored_len: stored.len() as u64,
         raw_len,
         crc32: crc.finalize(),
         item_count,
         stored,
     })
+}
+
+fn write_encoded_section(
+    writer: &mut BufWriter<File>,
+    directory: &mut Vec<SectionDirectoryEntry>,
+    offset: &mut u64,
+    section: EncodedSection,
+) -> Result<()> {
+    writer
+        .write_all(&section.stored)
+        .map_err(|source| io_err("<sqrb-stream>", source))?;
+    directory.push(SectionDirectoryEntry {
+        id: section.id,
+        flags: section.flags,
+        offset: *offset,
+        stored_len: section.stored_len,
+        raw_len: section.raw_len,
+        crc32: section.crc32,
+        item_count: section.item_count,
+    });
+    *offset += section.stored_len;
+    Ok(())
 }
 
 pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> {
@@ -121,178 +156,212 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
         replay: bundle.replay.clone(),
     };
 
-    let mut sections = vec![
-        encode_section(
-            SectionId::Manifest,
-            true,
-            false,
-            1,
-            serde_json::to_vec_pretty(&manifest)?,
-        )?,
-        encode_section(
-            SectionId::Teams,
-            false,
-            false,
-            bundle.teams.len() as u32,
-            to_msgpack_vec(&bundle.teams)?,
-        )?,
-        encode_section(
-            SectionId::Squads,
-            false,
-            false,
-            bundle.squads.len() as u32,
-            to_msgpack_vec(&bundle.squads)?,
-        )?,
-        encode_section(
-            SectionId::Players,
-            false,
-            false,
-            bundle.players.len() as u32,
-            to_msgpack_vec(&bundle.players)?,
-        )?,
-        encode_section(
-            SectionId::Vehicles,
-            false,
-            false,
-            bundle.actors.vehicles.len() as u32,
-            to_msgpack_vec(&bundle.actors.vehicles)?,
-        )?,
-        encode_section(
-            SectionId::Helicopters,
-            false,
-            false,
-            bundle.actors.helicopters.len() as u32,
-            to_msgpack_vec(&bundle.actors.helicopters)?,
-        )?,
-        encode_section(
-            SectionId::Deployables,
-            false,
-            false,
-            bundle.actors.deployables.len() as u32,
-            to_msgpack_vec(&bundle.actors.deployables)?,
-        )?,
-        encode_section(
-            SectionId::Components,
-            false,
-            false,
-            bundle.actors.components.len() as u32,
-            to_msgpack_vec(&bundle.actors.components)?,
-        )?,
-        encode_section(
-            SectionId::PlayerTracks,
-            false,
-            true,
-            bundle.tracks.players.len() as u32,
-            to_msgpack_vec(&bundle.tracks.players)?,
-        )?,
-        encode_section(
-            SectionId::VehicleTracks,
-            false,
-            true,
-            bundle.tracks.vehicles.len() as u32,
-            to_msgpack_vec(&bundle.tracks.vehicles)?,
-        )?,
-        encode_section(
-            SectionId::HelicopterTracks,
-            false,
-            true,
-            bundle.tracks.helicopters.len() as u32,
-            to_msgpack_vec(&bundle.tracks.helicopters)?,
-        )?,
-        encode_section(
-            SectionId::Kills,
-            false,
-            false,
-            bundle.events.kills.len() as u32,
-            to_msgpack_vec(&bundle.events.kills)?,
-        )?,
-        encode_section(
-            SectionId::Deployments,
-            false,
-            false,
-            bundle.events.deployments.len() as u32,
-            to_msgpack_vec(&bundle.events.deployments)?,
-        )?,
-        encode_section(
-            SectionId::SeatChanges,
-            false,
-            false,
-            bundle.events.seat_changes.len() as u32,
-            to_msgpack_vec(&bundle.events.seat_changes)?,
-        )?,
-        encode_section(
-            SectionId::ComponentStates,
-            false,
-            true,
-            bundle.events.component_states.len() as u32,
-            to_msgpack_vec(&bundle.events.component_states)?,
-        )?,
-        encode_section(
-            SectionId::VehicleStates,
-            false,
-            true,
-            bundle.events.vehicle_states.len() as u32,
-            to_msgpack_vec(&bundle.events.vehicle_states)?,
-        )?,
-        encode_section(
-            SectionId::WeaponStates,
-            false,
-            true,
-            bundle.events.weapon_states.len() as u32,
-            to_msgpack_vec(&bundle.events.weapon_states)?,
-        )?,
-        encode_section(
-            SectionId::Properties,
-            false,
-            true,
-            bundle.events.properties.len() as u32,
-            to_msgpack_vec(&bundle.events.properties)?,
-        )?,
-        encode_section(
-            SectionId::Diagnostics,
-            false,
-            false,
-            1,
-            to_msgpack_vec(&bundle.diagnostics)?,
-        )?,
-    ];
-
     let header_len = 4 + 2 + 2 + 4 + 8 + 4 + 8;
-    let directory_entry_len = 2 + 2 + 4 + 8 + 8 + 8 + 4 + 4;
     let mut offset = header_len as u64;
+    let file = File::create(path).map_err(|source| io_err(path, source))?;
+    let mut writer = BufWriter::new(file);
+    let mut directory = Vec::with_capacity(19);
 
-    for section in &mut sections {
-        section.offset = offset;
-        offset += section.stored_len;
+    writer
+        .write_all(SQRB_MAGIC)
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&SQRB_MAJOR.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&SQRB_MINOR.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&19u32.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&0u64.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&0u32.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    writer
+        .write_all(&0u64.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+
+    macro_rules! stream_section {
+        ($id:expr, $json:expr, $compress:expr, $count:expr, $raw:expr) => {{
+            let section = encode_section($id, $json, $compress, $count, $raw)?;
+            write_encoded_section(&mut writer, &mut directory, &mut offset, section)?;
+        }};
     }
+
+    stream_section!(
+        SectionId::Manifest,
+        true,
+        false,
+        1,
+        serde_json::to_vec_pretty(&manifest)?
+    );
+    stream_section!(
+        SectionId::Teams,
+        false,
+        false,
+        bundle.teams.len() as u32,
+        to_msgpack_vec(&bundle.teams)?
+    );
+    stream_section!(
+        SectionId::Squads,
+        false,
+        false,
+        bundle.squads.len() as u32,
+        to_msgpack_vec(&bundle.squads)?
+    );
+    stream_section!(
+        SectionId::Players,
+        false,
+        false,
+        bundle.players.len() as u32,
+        to_msgpack_vec(&bundle.players)?
+    );
+    stream_section!(
+        SectionId::Vehicles,
+        false,
+        false,
+        bundle.actors.vehicles.len() as u32,
+        to_msgpack_vec(&bundle.actors.vehicles)?
+    );
+    stream_section!(
+        SectionId::Helicopters,
+        false,
+        false,
+        bundle.actors.helicopters.len() as u32,
+        to_msgpack_vec(&bundle.actors.helicopters)?
+    );
+    stream_section!(
+        SectionId::Deployables,
+        false,
+        false,
+        bundle.actors.deployables.len() as u32,
+        to_msgpack_vec(&bundle.actors.deployables)?
+    );
+    stream_section!(
+        SectionId::Components,
+        false,
+        false,
+        bundle.actors.components.len() as u32,
+        to_msgpack_vec(&bundle.actors.components)?
+    );
+    stream_section!(
+        SectionId::PlayerTracks,
+        false,
+        true,
+        bundle.tracks.players.len() as u32,
+        to_msgpack_vec(&bundle.tracks.players)?
+    );
+    stream_section!(
+        SectionId::VehicleTracks,
+        false,
+        true,
+        bundle.tracks.vehicles.len() as u32,
+        to_msgpack_vec(&bundle.tracks.vehicles)?
+    );
+    stream_section!(
+        SectionId::HelicopterTracks,
+        false,
+        true,
+        bundle.tracks.helicopters.len() as u32,
+        to_msgpack_vec(&bundle.tracks.helicopters)?
+    );
+    stream_section!(
+        SectionId::Kills,
+        false,
+        false,
+        bundle.events.kills.len() as u32,
+        to_msgpack_vec(&bundle.events.kills)?
+    );
+    stream_section!(
+        SectionId::Deployments,
+        false,
+        false,
+        bundle.events.deployments.len() as u32,
+        to_msgpack_vec(&bundle.events.deployments)?
+    );
+    stream_section!(
+        SectionId::SeatChanges,
+        false,
+        false,
+        bundle.events.seat_changes.len() as u32,
+        to_msgpack_vec(&bundle.events.seat_changes)?
+    );
+    stream_section!(
+        SectionId::ComponentStates,
+        false,
+        true,
+        bundle.events.component_states.len() as u32,
+        to_msgpack_vec(&bundle.events.component_states)?
+    );
+    stream_section!(
+        SectionId::VehicleStates,
+        false,
+        true,
+        bundle.events.vehicle_states.len() as u32,
+        to_msgpack_vec(&bundle.events.vehicle_states)?
+    );
+    stream_section!(
+        SectionId::WeaponStates,
+        false,
+        true,
+        bundle.events.weapon_states.len() as u32,
+        to_msgpack_vec(&bundle.events.weapon_states)?
+    );
+    stream_section!(
+        SectionId::Properties,
+        false,
+        true,
+        bundle.events.properties.len() as u32,
+        to_msgpack_vec(&bundle.events.properties)?
+    );
+    stream_section!(
+        SectionId::Diagnostics,
+        false,
+        false,
+        1,
+        to_msgpack_vec(&bundle.diagnostics)?
+    );
 
     let directory_offset = offset;
-    let mut file = Vec::with_capacity(offset as usize + sections.len() * directory_entry_len);
-
-    file.extend_from_slice(SQRB_MAGIC);
-    file.extend_from_slice(&SQRB_MAJOR.to_le_bytes());
-    file.extend_from_slice(&SQRB_MINOR.to_le_bytes());
-    file.extend_from_slice(&(sections.len() as u32).to_le_bytes());
-    file.extend_from_slice(&directory_offset.to_le_bytes());
-    file.extend_from_slice(&0u32.to_le_bytes());
-    file.extend_from_slice(&0u64.to_le_bytes());
-
-    for section in &sections {
-        file.extend_from_slice(&section.stored);
+    for section in &directory {
+        writer
+            .write_all(&(section.id as u16).to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.flags.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&0u32.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.offset.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.stored_len.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.raw_len.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.crc32.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
+        writer
+            .write_all(&section.item_count.to_le_bytes())
+            .map_err(|source| io_err(path, source))?;
     }
+    writer.flush().map_err(|source| io_err(path, source))?;
 
-    for section in &sections {
-        file.extend_from_slice(&(section.id as u16).to_le_bytes());
-        file.extend_from_slice(&section.flags.to_le_bytes());
-        file.extend_from_slice(&0u32.to_le_bytes());
-        file.extend_from_slice(&section.offset.to_le_bytes());
-        file.extend_from_slice(&section.stored_len.to_le_bytes());
-        file.extend_from_slice(&section.raw_len.to_le_bytes());
-        file.extend_from_slice(&section.crc32.to_le_bytes());
-        file.extend_from_slice(&section.item_count.to_le_bytes());
-    }
-
-    fs::write(path, file).map_err(|source| io_err(path, source))
+    let mut file = writer
+        .into_inner()
+        .map_err(|source| io_err(path, source.into_error()))?;
+    file.seek(SeekFrom::Start(12))
+        .map_err(|source| io_err(path, source))?;
+    file.write_all(&directory_offset.to_le_bytes())
+        .map_err(|source| io_err(path, source))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +420,16 @@ pub(crate) fn read_sqrb(path: impl AsRef<Path>) -> Result<Bundle> {
     let directory_offset = read_u64(&bytes, &mut cursor)? as usize;
     let _flags = read_u32(&bytes, &mut cursor)?;
     let _reserved = read_u64(&bytes, &mut cursor)?;
+
+    // `directory_offset` starts as a placeholder and gets patched at the end.
+    // If it is still zero or out of range, the file is probably truncated.
+    if directory_offset < 32 || directory_offset > bytes.len() {
+        return Err(Error::InvalidSqrb(format!(
+            "directory offset {directory_offset} is out of range (file size {}) — \
+             the bundle is likely truncated or the writer did not patch the header",
+            bytes.len()
+        )));
+    }
 
     let mut directory = Vec::with_capacity(section_count);
     let mut dir_cursor = directory_offset;

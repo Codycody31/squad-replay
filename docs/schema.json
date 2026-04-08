@@ -1,0 +1,676 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Codycody31/squad-replay/master/docs/schema.json",
+  "title": "SquadReplay Bundle (SQRJ v1)",
+  "description": "JSON Schema for .sqrj.json bundles produced by squadreplay. Mirrors the Rust Bundle in src/model.rs. Also authoritative for the named MessagePack payloads inside .sqrb section payloads.",
+  "type": "object",
+  "required": [
+    "schema",
+    "replay",
+    "teams",
+    "squads",
+    "players",
+    "actors",
+    "tracks",
+    "events",
+    "diagnostics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema":      { "$ref": "#/$defs/SchemaInfo" },
+    "replay":      { "$ref": "#/$defs/ReplayInfoSection" },
+    "teams":       { "type": "array", "items": { "$ref": "#/$defs/Team" } },
+    "squads":      { "type": "array", "items": { "$ref": "#/$defs/Squad" } },
+    "players":     { "type": "array", "items": { "$ref": "#/$defs/Player" } },
+    "actors":      { "$ref": "#/$defs/ActorGroups" },
+    "tracks":      { "$ref": "#/$defs/TrackGroups" },
+    "events":      { "$ref": "#/$defs/EventGroups" },
+    "diagnostics": { "$ref": "#/$defs/Diagnostics" }
+  },
+
+  "$defs": {
+
+    "U16": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "U32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "U64": { "type": "integer", "minimum": 0 },
+    "I32": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+    "I64": { "type": "integer" },
+    "F32": { "type": "number" },
+    "F64": { "type": "number" },
+
+    "NullableString":  { "type": ["string", "null"] },
+    "NullableU32":     { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+    "NullableU64":     { "type": ["integer", "null"], "minimum": 0 },
+    "NullableI32":     { "type": ["integer", "null"], "minimum": -2147483648, "maximum": 2147483647 },
+    "NullableI64":     { "type": ["integer", "null"] },
+    "NullableF64":     { "type": ["number", "null"] },
+    "NullableBool":    { "type": ["boolean", "null"] },
+    "StringArray":     { "type": "array", "items": { "type": "string" } },
+
+    "SchemaInfo": {
+      "type": "object",
+      "required": ["name", "version", "profile"],
+      "additionalProperties": false,
+      "properties": {
+        "name":    { "type": "string", "const": "sqrj" },
+        "version": { "$ref": "#/$defs/U16" },
+        "profile": { "type": "string" }
+      }
+    },
+
+    "ReplaySourceInfo": {
+      "type": "object",
+      "required": ["file_name", "size_bytes", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "file_name":  { "type": "string" },
+        "size_bytes": { "$ref": "#/$defs/U64" },
+        "sha256":     { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+
+    "ReplayEngineInfo": {
+      "type": "object",
+      "required": ["engine_version", "net_version", "notes"],
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": { "$ref": "#/$defs/NullableString" },
+        "net_version":    { "$ref": "#/$defs/NullableU32" },
+        "notes":          { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "ReplayInfoSection": {
+      "type": "object",
+      "required": [
+        "source",
+        "engine",
+        "map_name",
+        "squad_version",
+        "duration_ms",
+        "started_at",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source":        { "$ref": "#/$defs/ReplaySourceInfo" },
+        "engine":        { "$ref": "#/$defs/ReplayEngineInfo" },
+        "map_name":      { "$ref": "#/$defs/NullableString" },
+        "squad_version": { "$ref": "#/$defs/NullableString" },
+        "duration_ms":   { "$ref": "#/$defs/U64" },
+        "started_at":    { "$ref": "#/$defs/NullableString" },
+        "notes":         { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "Team": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "faction",
+        "faction_setup_id",
+        "tickets",
+        "commander_state_guid",
+        "team_state_guid",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id":                   { "$ref": "#/$defs/U32" },
+        "name":                 { "$ref": "#/$defs/NullableString" },
+        "faction":              { "$ref": "#/$defs/NullableString" },
+        "faction_setup_id":     { "$ref": "#/$defs/NullableString" },
+        "tickets":              { "$ref": "#/$defs/NullableU32" },
+        "commander_state_guid": { "$ref": "#/$defs/NullableU32" },
+        "team_state_guid":      { "$ref": "#/$defs/NullableU32" },
+        "notes":                { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "Squad": {
+      "type": "object",
+      "required": [
+        "id",
+        "raw_team_id",
+        "team_id",
+        "faction",
+        "squad_state_guid",
+        "name",
+        "leader_player_state_guid",
+        "leader_name",
+        "leader_steam_id",
+        "leader_eos_id",
+        "creator_name",
+        "creator_identity_raw",
+        "creator_steam_id",
+        "creator_eos_id",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id":                       { "$ref": "#/$defs/U32" },
+        "raw_team_id":              { "$ref": "#/$defs/NullableU32" },
+        "team_id":                  { "$ref": "#/$defs/NullableU32" },
+        "faction":                  { "$ref": "#/$defs/NullableString" },
+        "squad_state_guid":         { "$ref": "#/$defs/NullableU32" },
+        "name":                     { "$ref": "#/$defs/NullableString" },
+        "leader_player_state_guid": { "$ref": "#/$defs/NullableU32" },
+        "leader_name":              { "$ref": "#/$defs/NullableString" },
+        "leader_steam_id":          { "$ref": "#/$defs/NullableString" },
+        "leader_eos_id":            { "$ref": "#/$defs/NullableString" },
+        "creator_name":             { "$ref": "#/$defs/NullableString" },
+        "creator_identity_raw":     { "$ref": "#/$defs/NullableString" },
+        "creator_steam_id":         { "$ref": "#/$defs/NullableString" },
+        "creator_eos_id":           { "$ref": "#/$defs/NullableString" },
+        "notes":                    { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "Player": {
+      "type": "object",
+      "required": [
+        "player_state_guid",
+        "name",
+        "steam_id",
+        "eos_id",
+        "online_user_id",
+        "identity_raw",
+        "soldier_guid",
+        "current_pawn_guid",
+        "team_id",
+        "faction",
+        "team_state_guid",
+        "squad_id",
+        "squad_state_guid",
+        "current_role_id",
+        "current_role_name",
+        "deploy_role_id",
+        "deploy_role_name",
+        "player_type_name",
+        "squad_leader_name",
+        "squad_creator_name",
+        "squad_creator_steam_id",
+        "squad_creator_eos_id",
+        "start_time_ms",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "player_state_guid":     { "$ref": "#/$defs/U32" },
+        "name":                  { "$ref": "#/$defs/NullableString" },
+        "steam_id":              { "$ref": "#/$defs/NullableString" },
+        "eos_id":                { "$ref": "#/$defs/NullableString" },
+        "online_user_id":        { "$ref": "#/$defs/NullableString" },
+        "identity_raw":          { "$ref": "#/$defs/NullableString" },
+        "soldier_guid":          { "$ref": "#/$defs/NullableU32" },
+        "current_pawn_guid":     { "$ref": "#/$defs/NullableU32" },
+        "team_id":               { "$ref": "#/$defs/NullableU32" },
+        "faction":               { "$ref": "#/$defs/NullableString" },
+        "team_state_guid":       { "$ref": "#/$defs/NullableU32" },
+        "squad_id":              { "$ref": "#/$defs/NullableU32" },
+        "squad_state_guid":      { "$ref": "#/$defs/NullableU32" },
+        "current_role_id":       { "$ref": "#/$defs/NullableI32" },
+        "current_role_name":     { "$ref": "#/$defs/NullableString" },
+        "deploy_role_id":        { "$ref": "#/$defs/NullableI32" },
+        "deploy_role_name":      { "$ref": "#/$defs/NullableString" },
+        "player_type_name":      { "$ref": "#/$defs/NullableString" },
+        "squad_leader_name":     { "$ref": "#/$defs/NullableString" },
+        "squad_creator_name":    { "$ref": "#/$defs/NullableString" },
+        "squad_creator_steam_id":{ "$ref": "#/$defs/NullableString" },
+        "squad_creator_eos_id":  { "$ref": "#/$defs/NullableString" },
+        "start_time_ms":         { "$ref": "#/$defs/NullableU64" },
+        "notes":                 { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "Vec3": {
+      "type": "object",
+      "required": ["x", "y", "z"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "$ref": "#/$defs/F64" },
+        "y": { "$ref": "#/$defs/F64" },
+        "z": { "$ref": "#/$defs/F64" }
+      }
+    },
+
+    "NullableVec3": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/Vec3" }
+      ]
+    },
+
+    "Rotator": {
+      "type": "object",
+      "required": ["pitch", "yaw", "roll"],
+      "additionalProperties": false,
+      "properties": {
+        "pitch": { "$ref": "#/$defs/F64" },
+        "yaw":   { "$ref": "#/$defs/F64" },
+        "roll":  { "$ref": "#/$defs/F64" }
+      }
+    },
+
+    "NullableRotator": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/Rotator" }
+      ]
+    },
+
+    "RepMovement": {
+      "type": "object",
+      "required": [
+        "location",
+        "rotation",
+        "linear_velocity",
+        "angular_velocity",
+        "server_frame",
+        "server_handle",
+        "rep_physics"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "location":         { "$ref": "#/$defs/NullableVec3" },
+        "rotation":         { "$ref": "#/$defs/NullableRotator" },
+        "linear_velocity":  { "$ref": "#/$defs/NullableVec3" },
+        "angular_velocity": { "$ref": "#/$defs/NullableVec3" },
+        "server_frame":     { "$ref": "#/$defs/NullableU32" },
+        "server_handle":    { "$ref": "#/$defs/NullableU32" },
+        "rep_physics":      { "type": "boolean" }
+      }
+    },
+
+    "NullableRepMovement": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/RepMovement" }
+      ]
+    },
+
+    "DecodedPropertyValue": {
+      "type": "object",
+      "required": [
+        "bits",
+        "int_packed",
+        "int32",
+        "float32",
+        "boolean",
+        "string",
+        "rep_movement"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bits":         { "$ref": "#/$defs/U32" },
+        "int_packed":   { "$ref": "#/$defs/NullableU32" },
+        "int32":        { "$ref": "#/$defs/NullableI32" },
+        "float32":      { "type": ["number", "null"] },
+        "boolean":      { "$ref": "#/$defs/NullableBool" },
+        "string":       { "$ref": "#/$defs/NullableString" },
+        "rep_movement": { "$ref": "#/$defs/NullableRepMovement" }
+      }
+    },
+
+    "ActorEntity": {
+      "type": "object",
+      "required": [
+        "actor_guid",
+        "channel_index",
+        "class_name",
+        "archetype_path",
+        "open_time_ms",
+        "close_time_ms",
+        "initial_location",
+        "initial_rotation",
+        "team",
+        "build_state",
+        "health",
+        "owner",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "actor_guid":       { "$ref": "#/$defs/U32" },
+        "channel_index":    { "$ref": "#/$defs/U32" },
+        "class_name":       { "$ref": "#/$defs/NullableString" },
+        "archetype_path":   { "$ref": "#/$defs/NullableString" },
+        "open_time_ms":     { "$ref": "#/$defs/U64" },
+        "close_time_ms":    { "$ref": "#/$defs/NullableU64" },
+        "initial_location": { "$ref": "#/$defs/NullableVec3" },
+        "initial_rotation": { "$ref": "#/$defs/NullableRotator" },
+        "team":             { "$ref": "#/$defs/NullableI64" },
+        "build_state":      { "$ref": "#/$defs/NullableI64" },
+        "health":           { "$ref": "#/$defs/NullableF64" },
+        "owner":            { "$ref": "#/$defs/NullableU32" },
+        "notes":            { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "ComponentEntity": {
+      "type": "object",
+      "required": [
+        "component_guid",
+        "owner_actor_guid",
+        "class_name",
+        "first_seen_ms",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "component_guid":   { "$ref": "#/$defs/U32" },
+        "owner_actor_guid": { "$ref": "#/$defs/NullableU32" },
+        "class_name":       { "$ref": "#/$defs/NullableString" },
+        "component_class":  { "$ref": "#/$defs/NullableString" },
+        "path_hint":        { "$ref": "#/$defs/NullableString" },
+        "group_path":       { "$ref": "#/$defs/NullableString" },
+        "first_seen_ms":    { "$ref": "#/$defs/U64" },
+        "notes":            { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "ActorGroups": {
+      "type": "object",
+      "required": ["vehicles", "helicopters", "deployables", "components"],
+      "additionalProperties": false,
+      "properties": {
+        "vehicles":    { "type": "array", "items": { "$ref": "#/$defs/ActorEntity" } },
+        "helicopters": { "type": "array", "items": { "$ref": "#/$defs/ActorEntity" } },
+        "deployables": { "type": "array", "items": { "$ref": "#/$defs/ActorEntity" } },
+        "components":  { "type": "array", "items": { "$ref": "#/$defs/ComponentEntity" } }
+      }
+    },
+
+    "TrackSample3": {
+      "type": "object",
+      "required": ["t_ms", "x", "y", "z"],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms": { "$ref": "#/$defs/U64" },
+        "x":    { "$ref": "#/$defs/F64" },
+        "y":    { "$ref": "#/$defs/F64" },
+        "z":    { "$ref": "#/$defs/F64" }
+      }
+    },
+
+    "Track3": {
+      "type": "object",
+      "required": ["key", "actor_guid", "player_state_guid", "class_name", "source", "samples"],
+      "additionalProperties": false,
+      "properties": {
+        "key":               { "type": "string" },
+        "actor_guid":        { "$ref": "#/$defs/NullableU32" },
+        "player_state_guid": { "$ref": "#/$defs/NullableU32" },
+        "class_name":        { "$ref": "#/$defs/NullableString" },
+        "source":            { "type": "string" },
+        "samples":           { "type": "array", "items": { "$ref": "#/$defs/TrackSample3" } }
+      }
+    },
+
+    "TrackGroups": {
+      "type": "object",
+      "required": ["players", "vehicles", "helicopters"],
+      "additionalProperties": false,
+      "properties": {
+        "players":     { "type": "array", "items": { "$ref": "#/$defs/Track3" } },
+        "vehicles":    { "type": "array", "items": { "$ref": "#/$defs/Track3" } },
+        "helicopters": { "type": "array", "items": { "$ref": "#/$defs/Track3" } }
+      }
+    },
+
+    "KillEvent": {
+      "type": "object",
+      "required": ["t_ms", "second", "victim_name", "killer_name", "victim_guid", "killer_guid", "was_incap"],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":        { "$ref": "#/$defs/U64" },
+        "second":      { "$ref": "#/$defs/U32" },
+        "victim_name": { "$ref": "#/$defs/NullableString" },
+        "killer_name": { "$ref": "#/$defs/NullableString" },
+        "victim_guid": { "$ref": "#/$defs/NullableU32" },
+        "killer_guid": { "$ref": "#/$defs/NullableU32" },
+        "was_incap":   { "$ref": "#/$defs/NullableBool" }
+      }
+    },
+
+    "DeploymentEvent": {
+      "type": "object",
+      "required": ["t_ms", "second", "actor_guid", "deployment_type", "class_name", "x", "y", "z"],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":            { "$ref": "#/$defs/U64" },
+        "second":          { "$ref": "#/$defs/U32" },
+        "actor_guid":      { "$ref": "#/$defs/NullableU32" },
+        "deployment_type": { "type": "string" },
+        "class_name":      { "$ref": "#/$defs/NullableString" },
+        "x":               { "$ref": "#/$defs/NullableF64" },
+        "y":               { "$ref": "#/$defs/NullableF64" },
+        "z":               { "$ref": "#/$defs/NullableF64" }
+      }
+    },
+
+    "SeatChangeEvent": {
+      "type": "object",
+      "required": [
+        "t_ms",
+        "second",
+        "actor_guid",
+        "component_guid",
+        "player_state_guid",
+        "vehicle_class",
+        "seat_attach_socket",
+        "attach_socket_name",
+        "occupant_name",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":               { "$ref": "#/$defs/U64" },
+        "second":             { "$ref": "#/$defs/U32" },
+        "actor_guid":         { "$ref": "#/$defs/NullableU32" },
+        "component_guid":     { "$ref": "#/$defs/NullableU32" },
+        "player_state_guid":  { "$ref": "#/$defs/NullableU32" },
+        "vehicle_class":      { "$ref": "#/$defs/NullableString" },
+        "seat_attach_socket": { "$ref": "#/$defs/NullableString" },
+        "attach_socket_name": { "$ref": "#/$defs/NullableString" },
+        "occupant_name":      { "$ref": "#/$defs/NullableString" },
+        "value":              { "$ref": "#/$defs/NullableString" }
+      }
+    },
+
+    "ComponentStateEvent": {
+      "type": "object",
+      "required": [
+        "t_ms",
+        "second",
+        "component_guid",
+        "owner_actor_guid",
+        "component_type",
+        "property_name",
+        "value_int",
+        "value_float",
+        "value_bool",
+        "value_string"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":             { "$ref": "#/$defs/U64" },
+        "second":           { "$ref": "#/$defs/U32" },
+        "component_guid":   { "$ref": "#/$defs/NullableU32" },
+        "owner_actor_guid": { "$ref": "#/$defs/NullableU32" },
+        "component_type":   { "type": "string" },
+        "component_name":   { "$ref": "#/$defs/NullableString" },
+        "component_class":  { "$ref": "#/$defs/NullableString" },
+        "group_path":       { "type": "string" },
+        "property_name":    { "type": "string" },
+        "decoded":          { "$ref": "#/$defs/DecodedPropertyValue" },
+        "value_int":        { "$ref": "#/$defs/NullableI64" },
+        "value_float":      { "$ref": "#/$defs/NullableF64" },
+        "value_bool":       { "$ref": "#/$defs/NullableBool" },
+        "value_string":     { "$ref": "#/$defs/NullableString" }
+      }
+    },
+
+    "VehicleStateEvent": {
+      "type": "object",
+      "required": [
+        "t_ms",
+        "second",
+        "actor_guid",
+        "property_name",
+        "value_int",
+        "value_float",
+        "value_bool",
+        "value_string"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":                { "$ref": "#/$defs/U64" },
+        "second":              { "$ref": "#/$defs/U32" },
+        "actor_guid":          { "$ref": "#/$defs/NullableU32" },
+        "actor_class":         { "$ref": "#/$defs/NullableString" },
+        "sub_object_net_guid": { "$ref": "#/$defs/NullableU32" },
+        "group_path":          { "type": "string" },
+        "property_name":       { "type": "string" },
+        "decoded":             { "$ref": "#/$defs/DecodedPropertyValue" },
+        "value_int":           { "$ref": "#/$defs/NullableI64" },
+        "value_float":         { "$ref": "#/$defs/NullableF64" },
+        "value_bool":          { "$ref": "#/$defs/NullableBool" },
+        "value_string":        { "$ref": "#/$defs/NullableString" }
+      }
+    },
+
+    "WeaponStateEvent": {
+      "type": "object",
+      "required": [
+        "t_ms",
+        "second",
+        "actor_guid",
+        "property_name",
+        "value_int",
+        "value_float",
+        "value_bool",
+        "value_string"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":                { "$ref": "#/$defs/U64" },
+        "second":              { "$ref": "#/$defs/U32" },
+        "actor_guid":          { "$ref": "#/$defs/NullableU32" },
+        "actor_class":         { "$ref": "#/$defs/NullableString" },
+        "sub_object_net_guid": { "$ref": "#/$defs/NullableU32" },
+        "group_path":          { "type": "string" },
+        "property_name":       { "type": "string" },
+        "decoded":             { "$ref": "#/$defs/DecodedPropertyValue" },
+        "value_int":           { "$ref": "#/$defs/NullableI64" },
+        "value_float":         { "$ref": "#/$defs/NullableF64" },
+        "value_bool":          { "$ref": "#/$defs/NullableBool" },
+        "value_string":        { "$ref": "#/$defs/NullableString" }
+      }
+    },
+
+    "PropertyEvent": {
+      "type": "object",
+      "required": [
+        "t_ms",
+        "second",
+        "channel_index",
+        "actor_guid",
+        "group_path",
+        "property_name",
+        "sub_object_net_guid",
+        "decoded"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "t_ms":                { "$ref": "#/$defs/U64" },
+        "second":              { "$ref": "#/$defs/U32" },
+        "channel_index":       { "$ref": "#/$defs/U32" },
+        "actor_guid":          { "$ref": "#/$defs/NullableU32" },
+        "group_path":          { "type": "string" },
+        "property_name":       { "type": "string" },
+        "sub_object_net_guid": { "$ref": "#/$defs/NullableU32" },
+        "decoded":             { "$ref": "#/$defs/DecodedPropertyValue" }
+      }
+    },
+
+    "EventGroups": {
+      "type": "object",
+      "required": [
+        "kills",
+        "deployments",
+        "seat_changes",
+        "component_states",
+        "vehicle_states",
+        "weapon_states",
+        "properties"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kills":            { "type": "array", "items": { "$ref": "#/$defs/KillEvent" } },
+        "deployments":      { "type": "array", "items": { "$ref": "#/$defs/DeploymentEvent" } },
+        "seat_changes":     { "type": "array", "items": { "$ref": "#/$defs/SeatChangeEvent" } },
+        "component_states": { "type": "array", "items": { "$ref": "#/$defs/ComponentStateEvent" } },
+        "vehicle_states":   { "type": "array", "items": { "$ref": "#/$defs/VehicleStateEvent" } },
+        "weapon_states":    { "type": "array", "items": { "$ref": "#/$defs/WeaponStateEvent" } },
+        "properties":       { "type": "array", "items": { "$ref": "#/$defs/PropertyEvent" } }
+      }
+    },
+
+    "StringInventory": {
+      "type": "object",
+      "required": ["ascii_strings", "utf16_strings", "class_paths", "ids"],
+      "additionalProperties": false,
+      "properties": {
+        "ascii_strings": { "$ref": "#/$defs/StringArray" },
+        "utf16_strings": { "$ref": "#/$defs/StringArray" },
+        "class_paths":   { "$ref": "#/$defs/StringArray" },
+        "ids":           { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "ProvenanceEntry": {
+      "type": "object",
+      "required": ["family", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "family":     { "type": "string" },
+        "provenance": { "type": "string" },
+        "notes":      { "$ref": "#/$defs/StringArray" }
+      }
+    },
+
+    "Diagnostics": {
+      "type": "object",
+      "required": [
+        "frames_processed",
+        "packets_processed",
+        "actor_opens",
+        "export_groups_discovered",
+        "guid_to_path_size",
+        "property_replications",
+        "position_samples",
+        "vehicle_position_samples",
+        "replay_data_chunks",
+        "warnings",
+        "string_inventory"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "frames_processed":         { "$ref": "#/$defs/U64" },
+        "packets_processed":        { "$ref": "#/$defs/U64" },
+        "actor_opens":              { "$ref": "#/$defs/U64" },
+        "export_groups_discovered": { "$ref": "#/$defs/U64" },
+        "guid_to_path_size":        { "$ref": "#/$defs/U64" },
+        "property_replications":    { "$ref": "#/$defs/U64" },
+        "position_samples":         { "$ref": "#/$defs/U64" },
+        "vehicle_position_samples": { "$ref": "#/$defs/U64" },
+        "replay_data_chunks":       { "$ref": "#/$defs/U64" },
+        "warnings":                 { "$ref": "#/$defs/StringArray" },
+        "string_inventory":         { "$ref": "#/$defs/StringInventory" },
+        "provenance_report":        { "type": "array", "items": { "$ref": "#/$defs/ProvenanceEntry" } }
+      }
+    }
+  }
+}

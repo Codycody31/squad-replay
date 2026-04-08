@@ -29,11 +29,7 @@ pub use error::{Error, Result};
 
 /// Parse a replay file from disk.
 pub fn parse_file(path: impl AsRef<Path>, options: &ParseOptions) -> Result<Bundle> {
-    let mut bundle = parser::parse_file(path)?;
-    if !options.include_property_events {
-        bundle.events.properties.clear();
-    }
-    Ok(bundle)
+    parser::parse_file(path, options.include_property_events)
 }
 
 /// Parse replay bytes that are already loaded in memory.
@@ -42,11 +38,7 @@ pub fn parse_bytes(
     file_name: Option<String>,
     options: &ParseOptions,
 ) -> Result<Bundle> {
-    let mut bundle = parser::parse_bytes(bytes.as_ref(), file_name)?;
-    if !options.include_property_events {
-        bundle.events.properties.clear();
-    }
-    Ok(bundle)
+    parser::parse_bytes(bytes.as_ref(), file_name, options.include_property_events)
 }
 
 /// Read a serialized bundle from disk.

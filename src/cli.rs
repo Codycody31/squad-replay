@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use squadreplay::bundle::Bundle;
 use squadreplay::{Error, ParseOptions, Result, compat, parse_file, read_bundle, sqrb, sqrj};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const ROOT_AFTER_HELP: &str = "\
@@ -240,7 +241,6 @@ fn write_outputs(
         fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
     }
 
-    // Fan-out stays in the CLI so library callers can choose their own output policy.
     let mut written = WrittenOutputs::default();
     for format in formats.iter() {
         match format {
@@ -259,8 +259,14 @@ fn write_outputs(
 
     if write_compat {
         let path = output_path_with_suffix(output_base, ".compat-match.json");
-        let bytes = serde_json::to_vec_pretty(&compat::from_bundle(bundle))?;
-        fs::write(&path, bytes).map_err(|source| io_err(&path, source))?;
+        let file = File::create(&path).map_err(|source| io_err(&path, source))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &compat::from_bundle(bundle))?;
+        // Explicit flush: `BufWriter::drop` swallows flush errors; without
+        // this we could report success while leaving a truncated file.
+        writer
+            .flush()
+            .map_err(|source| io_err(&path, source))?;
         written.compat_json = Some(path);
     }
 

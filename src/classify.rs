@@ -198,8 +198,8 @@ pub fn classify_deployable_event_type(type_name: &str) -> &'static str {
     }
 }
 
-pub fn infer_component_type(group_path: &str, path_hint: Option<&str>) -> String {
-    let kind = if contains_ignore_ascii_case(group_path, "sqrotorcomponent")
+pub fn infer_component_type_name(group_path: &str, path_hint: Option<&str>) -> &'static str {
+    if contains_ignore_ascii_case(group_path, "sqrotorcomponent")
         || path_hint.is_some_and(|hint| contains_ignore_ascii_case(hint, "rotor"))
     {
         "rotor"
@@ -221,8 +221,12 @@ pub fn infer_component_type(group_path: &str, path_hint: Option<&str>) -> String
         "seat"
     } else {
         "component"
-    };
-    kind.to_string()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn infer_component_type(group_path: &str, path_hint: Option<&str>) -> String {
+    infer_component_type_name(group_path, path_hint).to_string()
 }
 
 pub fn infer_group_leaf(path: &str) -> &str {

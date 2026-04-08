@@ -6,12 +6,13 @@ use crate::bundle::{
     VehicleStateEvent, WeaponStateEvent,
 };
 use crate::classify::{
-    classify_deployable_event_type, infer_component_type, infer_group_leaf,
+    classify_deployable_event_type, infer_component_type_name, infer_group_leaf,
     is_deployable_primary_type, is_helicopter_type, is_soldier_type, is_vehicle_type,
     normalize_type,
 };
 use crate::error::{Error, Result};
 use crate::unreal_names::unreal_name;
+use rayon::join;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -231,7 +232,9 @@ struct PartialBunch {
 
 #[derive(Debug, Clone, Default)]
 struct ParseState {
-    groups_by_path: HashMap<String, ExportGroup>,
+    groups_by_path: HashMap<String, Arc<ExportGroup>>,
+    // First path seen for each canonical leaf.
+    groups_by_leaf: HashMap<String, String>,
     groups_by_index: HashMap<u32, String>,
     guid_to_path: HashMap<u32, String>,
     channels: HashMap<u32, ChannelState>,
@@ -242,8 +245,21 @@ struct ParseState {
     external_data: HashMap<u32, ExternalData>,
     actor_builders: HashMap<u32, ActorBuilder>,
     player_builders: HashMap<u32, PlayerBuilder>,
+    player_actor_to_state: HashMap<u32, u32>,
     deployables: HashMap<u32, DeployableBuilder>,
     component_builders: HashMap<u32, ComponentBuilder>,
+    teams_by_actor_guid: BTreeMap<u32, TeamTemp>,
+    public_squads_by_state_guid: BTreeMap<u32, SquadTemp>,
+    private_squads_by_actor_guid: BTreeMap<u32, SquadTemp>,
+    private_to_public_squad_guid: HashMap<u32, u32>,
+    seat_meta_by_guid: HashMap<u32, SeatMeta>,
+    seat_change_candidates: Vec<SeatChangeCandidate>,
+    seen_seat_keys: HashSet<SeenSeatKey>,
+    kill_states: HashMap<u32, DeathState>,
+    kill_candidates: Vec<KillCandidate>,
+    kill_dedup: HashSet<(u64, u32, bool)>,
+    seen_deployment_actor_guids: HashSet<u32>,
+    retain_property_events: bool,
     property_events: Vec<PropertyEvent>,
     component_state_events: Vec<ComponentStateEvent>,
     deployment_events: Vec<DeploymentEvent>,
@@ -270,6 +286,65 @@ struct ExternalData {
 
 type VehicleTrackEntry = (Option<u32>, Option<String>, Vec<TrackSample3>);
 type SeenSeatKey = (u64, Option<u32>, Option<u32>, Option<u32>, String);
+
+#[derive(Debug, Clone, Default)]
+struct TeamTemp {
+    id: Option<u32>,
+    team_state_guid: Option<u32>,
+    name: Option<String>,
+    faction_from_state: Option<String>,
+    faction_setup_id: Option<String>,
+    tickets: Option<u32>,
+    commander_state_guid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SquadTemp {
+    id: Option<u32>,
+    raw_team_id: Option<u32>,
+    squad_state_guid: Option<u32>,
+    leader_player_state_guid: Option<u32>,
+    creator_player_state_guid: Option<u32>,
+    name: Option<String>,
+    leader_name: Option<String>,
+    leader_steam_id: Option<String>,
+    leader_eos_id: Option<String>,
+    creator_name: Option<String>,
+    creator_identity_raw: Option<String>,
+    creator_steam_id: Option<String>,
+    creator_eos_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SeatMeta {
+    vehicle_actor_guid: Option<u32>,
+    vehicle_class: Option<String>,
+    seat_attach_socket: Option<String>,
+    attach_socket_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeathState {
+    dead: Option<bool>,
+    incap: Option<bool>,
+    health: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct SeatChangeCandidate {
+    t_ms: u64,
+    second: u32,
+    component_guid: Option<u32>,
+    player_state_guid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct KillCandidate {
+    t_ms: u64,
+    second: u32,
+    victim_guid: u32,
+    was_incap: bool,
+}
 
 #[derive(Clone, Copy)]
 struct PropertyContext<'a> {
@@ -360,15 +435,20 @@ impl<'a> ByteCursor<'a> {
     }
 }
 
+/// Bit reader for replay payloads.
+///
+/// `last_bit` is always clamped to the backing buffer, and every read goes
+/// through `can_read` before it allocates or indexes into `data`.
 #[derive(Debug, Clone, Default)]
 struct BitReader {
     data: Arc<Vec<u8>>,
     offset: usize,
+    /// Logical end of the readable window, in bits.
     last_bit: usize,
     offsets: Vec<Option<usize>>,
     is_error: bool,
-    header: DemoHeader,
-    outer: OuterInfo,
+    header: Arc<DemoHeader>,
+    outer: Arc<OuterInfo>,
 }
 
 impl BitReader {
@@ -381,31 +461,38 @@ impl BitReader {
             last_bit,
             offsets: Vec::new(),
             is_error: false,
-            header: DemoHeader::default(),
-            outer: OuterInfo::default(),
+            header: Arc::new(DemoHeader::default()),
+            outer: Arc::new(OuterInfo::default()),
         }
     }
 
     fn with_bounds(data: impl Into<Arc<Vec<u8>>>, bit_count: usize) -> Self {
         let mut reader = Self::new(data);
-        reader.last_bit = bit_count;
+        // Never trust a caller-provided bit count past the actual buffer.
+        let physical_bits = reader.data.len() * 8;
+        reader.last_bit = bit_count.min(physical_bits);
         reader
     }
 
+    /// Clones the current read window, but starts with a fresh offset stack.
     fn clone_window(&self) -> Self {
         Self {
             data: Arc::clone(&self.data),
             offset: self.offset,
             last_bit: self.last_bit,
-            offsets: self.offsets.clone(),
+            offsets: Vec::new(),
             is_error: self.is_error,
-            header: self.header.clone(),
-            outer: self.outer.clone(),
+            header: Arc::clone(&self.header),
+            outer: Arc::clone(&self.outer),
         }
     }
 
+    /// Returns whether `bits` more bits fit in the current window.
     fn can_read(&self, bits: usize) -> bool {
-        self.offset + bits <= self.last_bit
+        match self.offset.checked_add(bits) {
+            Some(end) => end <= self.last_bit,
+            None => false,
+        }
     }
 
     fn at_end(&self) -> bool {
@@ -462,6 +549,11 @@ impl BitReader {
     }
 
     fn read_bits(&mut self, count: usize) -> Vec<u8> {
+        // Check bounds before we size the output buffer.
+        if !self.can_read(count) {
+            self.is_error = true;
+            return Vec::new();
+        }
         let mut out = vec![0u8; count.div_ceil(8)];
         let mut read_bytes = 0usize;
 
@@ -503,8 +595,13 @@ impl BitReader {
         out
     }
 
-    fn read_bits_to_unsigned_int(&mut self, mut count: usize) -> u32 {
-        let mut value = 0u32;
+    fn read_bits_to_unsigned_int(&mut self, mut count: usize) -> u64 {
+        if count > 64 {
+            self.is_error = true;
+            return 0;
+        }
+
+        let mut value = 0u64;
         let mut read_bits = 0usize;
 
         if (self.offset & 7) == 0 {
@@ -514,7 +611,7 @@ impl BitReader {
                     self.is_error = true;
                     return 0;
                 }
-                value |= (self.data[self.offset / 8] as u32) << (index * 8);
+                value |= (self.data[self.offset / 8] as u64) << (index * 8);
                 index += 1;
                 count -= 8;
                 read_bits += 8;
@@ -525,7 +622,7 @@ impl BitReader {
             }
         }
 
-        let mut current_bit = 1u32 << read_bits;
+        let mut current_bit = 1u64 << read_bits;
         let mut current_byte = self.data.get(self.offset / 8).copied().unwrap_or(0);
         let mut current_byte_bit = 1u8 << (self.offset & 7);
 
@@ -587,14 +684,19 @@ impl BitReader {
     }
 
     fn read_bytes(&mut self, byte_count: usize) -> Vec<u8> {
+        // Check bounds before we allocate for the unaligned path.
+        let Some(bit_count) = byte_count.checked_mul(8) else {
+            self.is_error = true;
+            return Vec::new();
+        };
+        if !self.can_read(bit_count) {
+            self.is_error = true;
+            return Vec::new();
+        }
         if (self.offset & 7) == 0 {
             let start = self.offset / 8;
-            if !self.can_read(byte_count * 8) {
-                self.is_error = true;
-                return Vec::new();
-            }
             let bytes = self.data[start..start + byte_count].to_vec();
-            self.offset += byte_count * 8;
+            self.offset += bit_count;
             bytes
         } else {
             let mut out = vec![0u8; byte_count];
@@ -643,7 +745,7 @@ impl BitReader {
             self.offset += 32;
             u32::from_le_bytes(self.data[start..start + 4].try_into().unwrap())
         } else {
-            self.read_bits_to_unsigned_int(32)
+            self.read_bits_to_unsigned_int(32) as u32
         }
     }
 
@@ -724,45 +826,51 @@ impl BitReader {
         if length == 0 {
             return String::new();
         }
-        if length < 0 {
-            let chars = (-length) as usize;
-            let byte_len = chars * 2;
-            let bytes = if (self.offset & 7) == 0 {
-                if !self.can_read(byte_len * 8) {
-                    self.is_error = true;
-                    return String::new();
-                }
-                let start = self.offset / 8;
-                self.offset += byte_len * 8;
-                &self.data[start..start + byte_len]
-            } else {
-                let bytes = self.read_bytes(byte_len);
-                if bytes.len() < byte_len {
-                    self.is_error = true;
-                    return String::new();
-                }
-                return String::from_utf16_lossy(
-                    &bytes[..bytes.len().saturating_sub(2)]
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                        .collect::<Vec<_>>(),
-                );
+        // Validate the declared string size before we allocate anything.
+        let byte_len: usize = if length < 0 {
+            // Negative lengths are UTF-16 char counts.
+            let chars = length.unsigned_abs() as usize;
+            let Some(bytes) = chars.checked_mul(2) else {
+                self.is_error = true;
+                return String::new();
             };
-            let payload = &bytes[..bytes.len().saturating_sub(2)];
-            let utf16 = payload
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect::<Vec<_>>();
-            String::from_utf16_lossy(&utf16)
+            bytes
         } else {
-            let byte_len = length as usize;
-            if (self.offset & 7) == 0 {
-                if !self.can_read(byte_len * 8) {
-                    self.is_error = true;
-                    return String::new();
-                }
+            length as usize
+        };
+        let Some(bit_len) = byte_len.checked_mul(8) else {
+            self.is_error = true;
+            return String::new();
+        };
+        if !self.can_read(bit_len) {
+            self.is_error = true;
+            return String::new();
+        }
+
+        if length < 0 {
+            let bytes = if (self.offset & 7) == 0 {
                 let start = self.offset / 8;
-                self.offset += byte_len * 8;
+                self.offset += bit_len;
+                std::borrow::Cow::Borrowed(&self.data[start..start + byte_len])
+            } else {
+                std::borrow::Cow::Owned(self.read_bytes(byte_len))
+            };
+            if bytes.len() < byte_len {
+                self.is_error = true;
+                return String::new();
+            }
+            let payload = &bytes[..bytes.len().saturating_sub(2)];
+            // Decode straight from the byte slice instead of building a Vec<u16>.
+            let utf16_iter = payload
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+            char::decode_utf16(utf16_iter)
+                .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect()
+        } else {
+            if (self.offset & 7) == 0 {
+                let start = self.offset / 8;
+                self.offset += bit_len;
                 let payload = &self.data[start..start + byte_len.saturating_sub(1)];
                 String::from_utf8_lossy(payload).into_owned()
             } else {
@@ -779,11 +887,27 @@ impl BitReader {
 
     fn skip_string(&mut self) {
         let length = self.read_i32();
-        if length < 0 {
-            self.skip_bytes((-length) as usize * 2);
+        let byte_len: usize = if length < 0 {
+            let chars = length.unsigned_abs() as usize;
+            let Some(bytes) = chars.checked_mul(2) else {
+                self.is_error = true;
+                return;
+            };
+            bytes
         } else if length > 0 {
-            self.skip_bytes(length as usize);
+            length as usize
+        } else {
+            return;
+        };
+        let Some(bit_len) = byte_len.checked_mul(8) else {
+            self.is_error = true;
+            return;
+        };
+        if !self.can_read(bit_len) {
+            self.is_error = true;
+            return;
         }
+        self.offset += bit_len;
     }
 
     fn read_fname(&mut self) -> String {
@@ -857,7 +981,7 @@ impl BitReader {
             let x = self.read_bits_to_unsigned_int(component_bits as usize);
             let y = self.read_bits_to_unsigned_int(component_bits as usize);
             let z = self.read_bits_to_unsigned_int(component_bits as usize);
-            let sign_bit = 1u32.wrapping_shl(component_bits - 1);
+            let sign_bit = 1u64.wrapping_shl(component_bits - 1);
             let x_sign = ((x ^ sign_bit) as i64 - sign_bit as i64) as f64;
             let y_sign = ((y ^ sign_bit) as i64 - sign_bit as i64) as f64;
             let z_sign = ((z ^ sign_bit) as i64 - sign_bit as i64) as f64;
@@ -974,9 +1098,23 @@ impl BitReader {
         (self.header.flags & 8) == 8
     }
 
-    fn append_data_from_checked(&mut self, data: &[u8], bit_count: usize) {
+    /// Appends bytes and extends the visible bit window.
+    ///
+    /// Returns `Err` if `bit_count` claims more bits than `data` actually has.
+    fn append_data_from_checked(
+        &mut self,
+        data: &[u8],
+        bit_count: usize,
+    ) -> Result<()> {
+        if bit_count > data.len().saturating_mul(8) {
+            self.is_error = true;
+            return Err(Error::InvalidReplay(
+                "partial bunch payload shorter than declared bit_count".to_string(),
+            ));
+        }
         Arc::make_mut(&mut self.data).extend_from_slice(data);
         self.last_bit += bit_count;
+        Ok(())
     }
 }
 
@@ -1032,89 +1170,123 @@ fn ignored_fname_value(value: &str) -> bool {
     )
 }
 
-fn canonical_group_leaf(path: &str) -> String {
-    let leaf = remove_path_prefix(path, "");
-    let leaf = leaf.split(':').next().unwrap_or(&leaf);
-    let leaf = leaf.trim_end_matches("_ClassNetCache");
-    let leaf = leaf.strip_prefix("Default__").unwrap_or(leaf);
-    leaf.to_string()
+fn canonical_group_leaf_ref(path: &str) -> &str {
+    let without_colon = path.split(':').next().unwrap_or(path);
+    let without_cache = without_colon.trim_end_matches("_ClassNetCache");
+    let without_dot = without_cache.rsplit('.').next().unwrap_or(without_cache);
+    let without_slash = without_dot.rsplit('/').next().unwrap_or(without_dot);
+    without_slash
+        .strip_prefix("Default__")
+        .unwrap_or(without_slash)
 }
 
-fn push_group_candidate(candidates: &mut Vec<String>, candidate: impl Into<String>) {
-    let candidate = candidate.into();
-    if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
-        candidates.push(candidate);
-    }
+fn canonical_script_well_known(normalized: &str) -> Option<&'static str> {
+    Some(match normalized {
+        "SQPlayerState" => "/Script/Squad.SQPlayerState",
+        "SQSquadState" => "/Script/Squad.SQSquadState",
+        "SQSquadStatePrivateToTeam" => "/Script/Squad.SQSquadStatePrivateToTeam",
+        "SQTeamState" => "/Script/Squad.SQTeamState",
+        "SQTeamStatePrivate" => "/Script/Squad.SQTeamStatePrivate",
+        _ => return None,
+    })
 }
 
+#[cfg(test)]
 fn canonical_script_group_candidates(hint: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
+    // Test helper only. The parser uses `group_for_hint` directly.
+    let mut out = Vec::new();
     let hint = hint.trim();
     if hint.is_empty() {
-        return candidates;
+        return out;
     }
-
-    push_group_candidate(&mut candidates, hint.to_string());
-
-    let normalized = canonical_group_leaf(hint);
-    push_group_candidate(&mut candidates, normalized.clone());
-
+    out.push(hint.to_string());
+    let normalized = canonical_group_leaf_ref(hint);
+    if !normalized.is_empty() && !out.iter().any(|value| value == normalized) {
+        out.push(normalized.to_string());
+    }
     if hint.starts_with("/Script/") {
         let trimmed = hint
             .split(':')
             .next()
             .unwrap_or(hint)
             .trim_end_matches("_ClassNetCache");
-        push_group_candidate(&mut candidates, trimmed.to_string());
+        if !trimmed.is_empty() && !out.iter().any(|value| value == trimmed) {
+            out.push(trimmed.to_string());
+        }
     }
-
-    match normalized.as_str() {
-        "SQPlayerState" => {
-            push_group_candidate(&mut candidates, "/Script/Squad.SQPlayerState".to_string());
+    if let Some(well_known) = canonical_script_well_known(normalized) {
+        if !out.iter().any(|value| value == well_known) {
+            out.push(well_known.to_string());
         }
-        "SQSquadState" => {
-            push_group_candidate(&mut candidates, "/Script/Squad.SQSquadState".to_string());
-        }
-        "SQSquadStatePrivateToTeam" => {
-            push_group_candidate(
-                &mut candidates,
-                "/Script/Squad.SQSquadStatePrivateToTeam".to_string(),
-            );
-        }
-        "SQTeamState" => {
-            push_group_candidate(&mut candidates, "/Script/Squad.SQTeamState".to_string());
-        }
-        "SQTeamStatePrivate" => {
-            push_group_candidate(
-                &mut candidates,
-                "/Script/Squad.SQTeamStatePrivate".to_string(),
-            );
-        }
-        _ => {}
     }
-
     if !normalized.contains('/') && !normalized.is_empty() {
-        push_group_candidate(&mut candidates, format!("/Script/Squad.{normalized}"));
+        let candidate = format!("/Script/Squad.{normalized}");
+        if !out.iter().any(|value| value == &candidate) {
+            out.push(candidate);
+        }
     }
-
-    candidates
+    out
 }
 
-fn group_for_hint(state: &ParseState, hint: &str) -> Option<ExportGroup> {
-    for candidate in canonical_script_group_candidates(hint) {
-        if let Some(group) = state.groups_by_path.get(&candidate) {
-            return Some(group.clone());
-        }
-    }
-
-    let normalized = canonical_group_leaf(hint);
-    if normalized.is_empty() {
+fn group_for_hint(state: &ParseState, hint: &str) -> Option<Arc<ExportGroup>> {
+    let hint = hint.trim();
+    if hint.is_empty() {
         return None;
     }
 
-    state.groups_by_path.iter().find_map(|(group_path, group)| {
-        (canonical_group_leaf(group_path) == normalized).then(|| group.clone())
-    })
+    // 1. Exact path.
+    if let Some(group) = state.groups_by_path.get(hint) {
+        return Some(Arc::clone(group));
+    }
+
+    // 2. Strip script suffixes like `:bar`.
+    if hint.starts_with("/Script/") {
+        let trimmed = hint
+            .split(':')
+            .next()
+            .unwrap_or(hint)
+            .trim_end_matches("_ClassNetCache");
+        if trimmed != hint {
+            if let Some(group) = state.groups_by_path.get(trimmed) {
+                return Some(Arc::clone(group));
+            }
+        }
+    }
+
+    // 3. Canonical leaf.
+    let leaf = canonical_group_leaf_ref(hint);
+    if leaf != hint {
+        if let Some(group) = state.groups_by_path.get(leaf) {
+            return Some(Arc::clone(group));
+        }
+    }
+
+    // 4. Well-known `/Script/Squad.*` aliases.
+    if let Some(well_known) = canonical_script_well_known(leaf) {
+        if let Some(group) = state.groups_by_path.get(well_known) {
+            return Some(Arc::clone(group));
+        }
+    }
+
+    // 5. Synthesized `/Script/Squad.{leaf}`.
+    if !leaf.is_empty() && !leaf.contains('/') {
+        // Only allocate if the earlier lookups missed.
+        let synthesized = format!("/Script/Squad.{leaf}");
+        if let Some(group) = state.groups_by_path.get(&synthesized) {
+            return Some(Arc::clone(group));
+        }
+    }
+
+    // 6. Fall back to the cached leaf -> path mapping.
+    if !leaf.is_empty() {
+        if let Some(path) = state.groups_by_leaf.get(leaf) {
+            if let Some(group) = state.groups_by_path.get(path) {
+                return Some(Arc::clone(group));
+            }
+        }
+    }
+
+    None
 }
 
 fn resolve_rep_group(
@@ -1122,38 +1294,40 @@ fn resolve_rep_group(
     actor: Option<&OpenedActor>,
     rep_object: Option<&str>,
     sub_object_net_guid: Option<u32>,
-) -> Option<ExportGroup> {
-    let mut hints = Vec::new();
-
+) -> Option<Arc<ExportGroup>> {
     if let Some(raw) = rep_object {
-        hints.push(raw.to_string());
+        if let Some(group) = group_for_hint(state, raw) {
+            return Some(group);
+        }
         if let Ok(net_guid) = raw.parse::<u32>() {
             if let Some(path) = state.guid_to_path.get(&net_guid) {
-                hints.push(path.clone());
+                if let Some(group) = group_for_hint(state, path) {
+                    return Some(group);
+                }
             }
         }
     }
 
     if let Some(sub_guid) = sub_object_net_guid {
         if let Some(path) = state.guid_to_path.get(&sub_guid) {
-            hints.push(path.clone());
+            if let Some(group) = group_for_hint(state, path) {
+                return Some(group);
+            }
         }
     }
 
     if let Some(actor) = actor {
         if let Some(archetype) = actor.archetype {
             if let Some(path) = state.guid_to_path.get(&archetype.value) {
-                hints.push(path.clone());
+                if let Some(group) = group_for_hint(state, path) {
+                    return Some(group);
+                }
             }
         }
         if let Some(path) = state.guid_to_path.get(&actor.actor_net_guid.value) {
-            hints.push(path.clone());
-        }
-    }
-
-    for hint in hints {
-        if let Some(group) = group_for_hint(state, &hint) {
-            return Some(group);
+            if let Some(group) = group_for_hint(state, path) {
+                return Some(group);
+            }
         }
     }
 
@@ -1307,6 +1481,154 @@ fn state_event_actor_class(state: &ParseState, actor_guid: Option<u32>) -> Optio
         })
 }
 
+fn merge_squad_temp(target: &mut SquadTemp, source: SquadTemp) {
+    if target.id.is_none() {
+        target.id = source.id;
+    }
+    if target.raw_team_id.is_none() {
+        target.raw_team_id = source.raw_team_id;
+    }
+    if target.squad_state_guid.is_none() {
+        target.squad_state_guid = source.squad_state_guid;
+    }
+    if target.leader_player_state_guid.is_none() {
+        target.leader_player_state_guid = source.leader_player_state_guid;
+    }
+    if target.creator_player_state_guid.is_none() {
+        target.creator_player_state_guid = source.creator_player_state_guid;
+    }
+    if target.name.is_none() {
+        target.name = source.name;
+    }
+    if target.leader_name.is_none() {
+        target.leader_name = source.leader_name;
+    }
+    if target.leader_steam_id.is_none() {
+        target.leader_steam_id = source.leader_steam_id;
+    }
+    if target.leader_eos_id.is_none() {
+        target.leader_eos_id = source.leader_eos_id;
+    }
+    if target.creator_name.is_none() {
+        target.creator_name = source.creator_name;
+    }
+    if target.creator_identity_raw.is_none() {
+        target.creator_identity_raw = source.creator_identity_raw;
+    }
+    if target.creator_steam_id.is_none() {
+        target.creator_steam_id = source.creator_steam_id;
+    }
+    if target.creator_eos_id.is_none() {
+        target.creator_eos_id = source.creator_eos_id;
+    }
+}
+
+fn apply_team_property(
+    team: &mut TeamTemp,
+    actor_guid: u32,
+    property_name: &str,
+    decoded: &DecodedPropertyValue,
+) {
+    team.team_state_guid.get_or_insert(actor_guid);
+    match property_name {
+        "ID" => team.id = decoded_preferred_u32(decoded),
+        "Tickets" => team.tickets = decoded_preferred_u32(decoded),
+        "CommanderState" => team.commander_state_guid = decoded_scalar_u32(decoded),
+        "Name" | "ShortName" | "DisplayName" => {
+            if let Some(value) = meaningful_decoded_string(decoded) {
+                team.name = Some(value);
+            }
+        }
+        "FactionSetupId" => {
+            if let Some(value) = decoded_scalar_string(decoded) {
+                team.faction_setup_id = Some(value.clone());
+                team.faction_from_state = Some(value);
+            }
+        }
+        "Faction" | "FactionId" | "FactionName" => {
+            if let Some(value) = decoded_scalar_string(decoded) {
+                team.faction_from_state = Some(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_squad_property(
+    squad: &mut SquadTemp,
+    property_name: &str,
+    decoded: &DecodedPropertyValue,
+) {
+    match property_name {
+        "ID" => squad.id = decoded_preferred_u32(decoded),
+        "Team" | "TeamId" | "TeamState" => {
+            squad.raw_team_id = decoded_preferred_u32(decoded);
+        }
+        "Name" | "SquadName" | "DisplayName" => {
+            if let Some(value) = decoded_scalar_string(decoded) {
+                squad.name = Some(value);
+            }
+        }
+        "Leader" | "LeaderState" | "LeaderPlayerState" => {
+            squad.leader_player_state_guid = decoded_scalar_u32(decoded);
+        }
+        "Creator" | "CreatorPlayerState" => {
+            squad.creator_player_state_guid = decoded_scalar_u32(decoded);
+        }
+        "LeaderName" => {
+            if let Some(value) = meaningful_decoded_string(decoded) {
+                squad.leader_name = Some(value);
+            }
+        }
+        "CreatorName" | "SquadCreatorName" => {
+            if let Some(value) = meaningful_decoded_string(decoded) {
+                squad.creator_name = Some(value);
+            }
+        }
+        "SquadCreatorSteamID" => {
+            if let Some(raw) = meaningful_decoded_string(decoded) {
+                squad.creator_identity_raw = Some(raw.clone());
+                let parsed = parse_identity_blob(&raw);
+                if squad.creator_steam_id.is_none() {
+                    squad.creator_steam_id = parsed.steam_id;
+                }
+                if squad.creator_eos_id.is_none() {
+                    squad.creator_eos_id = parsed.eos_id;
+                }
+            }
+        }
+        "CreatorSteamId" => {
+            if let Some(value) = meaningful_decoded_string(decoded) {
+                squad.creator_steam_id = Some(value);
+            }
+        }
+        "CreatorEOSId" | "CreatorEosId" | "CreatorEpicId" => {
+            if let Some(value) = meaningful_decoded_string(decoded) {
+                squad.creator_eos_id = Some(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn maybe_emit_kill(
+    state: &mut ParseState,
+    t_ms: u64,
+    second: u32,
+    player_state_guid: u32,
+    was_incap: bool,
+) {
+    let key = (t_ms / 1000, player_state_guid, was_incap);
+    if state.kill_dedup.insert(key) {
+        state.kill_candidates.push(KillCandidate {
+            t_ms,
+            second,
+            victim_guid: player_state_guid,
+            was_incap,
+        });
+    }
+}
+
 fn canonical_provenance_report() -> Vec<ProvenanceEntry> {
     vec![
         ProvenanceEntry {
@@ -1410,10 +1732,10 @@ fn parse_online_identity(value: &str, player: &mut PlayerBuilder) {
 
 fn decode_rep_movement_with_config(
     mut reader: BitReader,
-    header: &DemoHeader,
+    header: &Arc<DemoHeader>,
     config: RepMovementDecodeConfig,
 ) -> Option<RepMovement> {
-    reader.header = header.clone();
+    reader.header = Arc::clone(header);
     if reader.get_bits_left() < config.skip_bits {
         return None;
     }
@@ -1466,13 +1788,13 @@ fn decode_rep_movement_with_config(
     Some(movement)
 }
 
-fn decode_rep_movement(reader: BitReader, header: &DemoHeader) -> Option<RepMovement> {
+fn decode_rep_movement(reader: BitReader, header: &Arc<DemoHeader>) -> Option<RepMovement> {
     decode_rep_movement_with_config(reader, header, STANDARD_REP_MOVEMENT_CONFIG)
 }
 
 fn decode_helicopter_component_rep_movement(
     reader: BitReader,
-    header: &DemoHeader,
+    header: &Arc<DemoHeader>,
 ) -> Option<RepMovement> {
     let payload_bits = reader.get_bits_left();
     let mut payload_reader = reader.clone_window();
@@ -1481,12 +1803,8 @@ fn decode_helicopter_component_rep_movement(
 
     let mut lenient_reader =
         BitReader::with_bounds(payload, payload_bits + HELO_DECODE_PADDING_BYTES * 8);
-    lenient_reader.header = header.clone();
+    lenient_reader.header = Arc::clone(header);
     decode_rep_movement_with_config(lenient_reader, header, PRIMARY_HELO_REP_MOVEMENT_CONFIG)
-}
-
-fn is_helicopter_movement_component_group(group_path: &str) -> bool {
-    canonical_group_leaf(group_path) == "SQHelicopterMovementComponent"
 }
 
 fn should_attempt_string_decode(property_name: &str) -> bool {
@@ -1542,7 +1860,7 @@ fn decode_textual_scalar(reader: &BitReader, property_name: &str) -> Option<Stri
 
 fn decode_generic_value(
     reader: &BitReader,
-    header: &DemoHeader,
+    header: &Arc<DemoHeader>,
     property_name: &str,
 ) -> DecodedPropertyValue {
     let bits = reader.get_bits_left();
@@ -1778,10 +2096,12 @@ fn scan_printable_strings(data: &[u8]) -> Vec<String> {
 
 fn scan_utf16_strings(data: &[u8]) -> Vec<String> {
     let mut strings = Vec::new();
+    // Reuse the scratch buffer instead of reallocating on every position.
+    let mut utf16: Vec<u16> = Vec::with_capacity(128);
     let mut i = 0usize;
     while i + 8 <= data.len() {
+        utf16.clear();
         let mut j = i;
-        let mut utf16 = Vec::new();
         while j + 1 < data.len() {
             let value = u16::from_le_bytes([data[j], data[j + 1]]);
             if value == 0 {
@@ -1807,8 +2127,8 @@ fn scan_utf16_strings(data: &[u8]) -> Vec<String> {
 }
 
 fn build_string_inventory(data: &[u8]) -> StringInventory {
-    let ascii_strings = scan_printable_strings(data);
-    let utf16_strings = scan_utf16_strings(data);
+    let (mut ascii_strings, mut utf16_strings) =
+        join(|| scan_printable_strings(data), || scan_utf16_strings(data));
 
     let class_paths = ascii_strings
         .iter()
@@ -1834,6 +2154,9 @@ fn build_string_inventory(data: &[u8]) -> StringInventory {
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+
+    ascii_strings.shrink_to_fit();
+    utf16_strings.shrink_to_fit();
 
     StringInventory {
         ascii_strings,
@@ -1867,14 +2190,19 @@ fn read_net_field_exports(replay: &mut BitReader, state: &mut ParseState) {
         let group_path = if is_exported {
             let pathname = replay.read_string();
             let num_exports = replay.read_int_packed();
-            state
-                .groups_by_path
-                .entry(pathname.clone())
-                .or_insert_with(|| ExportGroup {
+            if !state.groups_by_path.contains_key(&pathname) {
+                let group = Arc::new(ExportGroup {
                     path_name: pathname.clone(),
                     net_field_exports_length: num_exports,
                     net_field_exports: HashMap::new(),
                 });
+                // Keep the first path we saw for each leaf.
+                state
+                    .groups_by_leaf
+                    .entry(canonical_group_leaf_ref(&pathname).to_string())
+                    .or_insert_with(|| pathname.clone());
+                state.groups_by_path.insert(pathname.clone(), group);
+            }
             state
                 .groups_by_index
                 .insert(path_name_index, pathname.clone());
@@ -1889,7 +2217,11 @@ fn read_net_field_exports(replay: &mut BitReader, state: &mut ParseState) {
 
         if let Some(export) = decode_export_field(replay) {
             if let Some(group) = state.groups_by_path.get_mut(&group_path) {
-                group.net_field_exports.insert(export.handle, export);
+                // This stays cheap as long as we do not keep long-lived clones
+                // of export groups elsewhere in the parser.
+                Arc::make_mut(group)
+                    .net_field_exports
+                    .insert(export.handle, export);
             }
         }
     }
@@ -1925,8 +2257,7 @@ fn read_external_data(replay: &mut BitReader, state: &mut ParseState) {
         let _something2 = replay.read_byte();
         let payload = replay.read_bytes(external_bytes.saturating_sub(3));
 
-        // Some replicated properties arrive out-of-band and are matched back to
-        // the owning net guid once the regular layout decode has identified them.
+        // Some properties arrive out-of-band and get matched back later.
         state
             .external_data
             .insert(net_guid, ExternalData { handle, payload });
@@ -1966,19 +2297,35 @@ fn ensure_component_builder(
     state: &mut ParseState,
     component_guid: u32,
     owner_actor_guid: Option<u32>,
-    path_hint: Option<String>,
     group_path: &str,
     t_ms: u64,
 ) {
+    // Fast path: most calls hit a fully-populated builder.
+    if let Some(builder) = state.component_builders.get(&component_guid) {
+        if builder.owner_actor_guid.is_some()
+            && builder.class_name.is_some()
+            && builder.component_class.is_some()
+            && builder.path_hint.is_some()
+            && builder.group_path.is_some()
+        {
+            return;
+        }
+    }
+
+    // Slow path: fill the missing bits once.
+    let path_hint_string = state.guid_to_path.get(&component_guid).cloned();
+    let path_hint = path_hint_string.as_deref();
+    let component_type = infer_component_type_name(group_path, path_hint);
+    let component_class = canonical_group_leaf_ref(group_path);
     let builder = state
         .component_builders
         .entry(component_guid)
         .or_insert_with(|| ComponentBuilder {
             component_guid,
             owner_actor_guid,
-            class_name: Some(infer_component_type(group_path, path_hint.as_deref())),
-            component_class: Some(canonical_group_leaf(group_path)),
-            path_hint: path_hint.clone(),
+            class_name: Some(component_type.to_string()),
+            component_class: Some(component_class.to_string()),
+            path_hint: path_hint_string.clone(),
             group_path: Some(group_path.to_string()),
             first_seen_ms: t_ms,
             notes: Vec::new(),
@@ -1988,13 +2335,13 @@ fn ensure_component_builder(
         builder.owner_actor_guid = owner_actor_guid;
     }
     if builder.class_name.is_none() {
-        builder.class_name = Some(infer_component_type(group_path, path_hint.as_deref()));
+        builder.class_name = Some(component_type.to_string());
     }
     if builder.component_class.is_none() {
-        builder.component_class = Some(canonical_group_leaf(group_path));
+        builder.component_class = Some(component_class.to_string());
     }
     if builder.path_hint.is_none() {
-        builder.path_hint = path_hint;
+        builder.path_hint = path_hint_string;
     }
     if builder.group_path.is_none() {
         builder.group_path = Some(group_path.to_string());
@@ -2006,11 +2353,9 @@ fn apply_property_event(
     context: PropertyContext<'_>,
     decoded: &DecodedPropertyValue,
 ) {
-    // Keep the raw property event, but also project the pieces we care about into
-    // actor, player, component, and movement views for later passes.
+    // Keep the raw event and update the derived views we build from it.
     let actor_guid = context.actor.map(|value| value.actor_net_guid.value);
-    let is_helicopter_movement_component =
-        is_helicopter_movement_component_group(context.group_path);
+    let is_helicopter_movement_component = context.group_leaf == "SQHelicopterMovementComponent";
 
     if let Some(channel_actor_guid) = actor_guid {
         let builder = state
@@ -2082,11 +2427,7 @@ fn apply_property_event(
                     z: builder.initial_location.map(|value| value.z),
                 });
 
-            if state
-                .deployment_events
-                .iter()
-                .all(|event| event.actor_guid != Some(channel_actor_guid))
-            {
+            if state.seen_deployment_actor_guids.insert(channel_actor_guid) {
                 state.deployment_events.push(DeploymentEvent {
                     t_ms: context.t_ms,
                     second: (context.t_ms / 1000) as u32,
@@ -2174,6 +2515,53 @@ fn apply_property_event(
                 }
                 _ => {}
             }
+
+            if let Some(guid) = player.soldier_guid {
+                state.player_actor_to_state.insert(guid, player_state_guid);
+            }
+            if let Some(guid) = player.current_pawn_guid {
+                state.player_actor_to_state.insert(guid, player_state_guid);
+            }
+        }
+    }
+
+    if let Some(team_actor_guid) = actor_guid {
+        match context.group_leaf {
+            "SQTeamState" | "SQTeamStatePrivate" => {
+                let team = state
+                    .teams_by_actor_guid
+                    .entry(team_actor_guid)
+                    .or_default();
+                apply_team_property(team, team_actor_guid, context.property_name, decoded);
+            }
+            "SQSquadState" => {
+                let squad = state
+                    .public_squads_by_state_guid
+                    .entry(team_actor_guid)
+                    .or_insert_with(|| SquadTemp {
+                        squad_state_guid: Some(team_actor_guid),
+                        ..SquadTemp::default()
+                    });
+                apply_squad_property(squad, context.property_name, decoded);
+            }
+            "SQSquadStatePrivateToTeam" => {
+                if context.property_name == "SquadState" {
+                    if let Some(public_guid) = decoded_scalar_u32(decoded) {
+                        state
+                            .private_to_public_squad_guid
+                            .insert(team_actor_guid, public_guid);
+                    }
+                }
+                let squad = state
+                    .private_squads_by_actor_guid
+                    .entry(team_actor_guid)
+                    .or_insert_with(|| SquadTemp {
+                        squad_state_guid: Some(team_actor_guid),
+                        ..SquadTemp::default()
+                    });
+                apply_squad_property(squad, context.property_name, decoded);
+            }
+            _ => {}
         }
     }
 
@@ -2201,8 +2589,7 @@ fn apply_property_event(
             decoded.rep_movement.clone(),
         ) {
             if component_guid != owner_actor_guid && movement.location.is_some() {
-                // Helicopter movement components report local-space transforms.
-                // We anchor them back onto the owning actor once the full track is known.
+                // These transforms are local-space; we anchor them later.
                 state.raw_helicopter_samples.push(HelicopterMovementSample {
                     t_ms: context.t_ms,
                     actor_guid: owner_actor_guid,
@@ -2238,17 +2625,47 @@ fn apply_property_event(
 
     if let Some(sub_guid) = context.sub_object_net_guid {
         if Some(sub_guid) != actor_guid {
-            let path_hint = state.guid_to_path.get(&sub_guid).cloned();
+            // Grab this before `ensure_component_builder` takes `&mut state`.
+            let component_type = infer_component_type_name(
+                context.group_path,
+                state.guid_to_path.get(&sub_guid).map(String::as_str),
+            );
             ensure_component_builder(
                 state,
                 sub_guid,
                 actor_guid,
-                path_hint.clone(),
                 context.group_path,
                 context.t_ms,
             );
-
-            let component_type = infer_component_type(context.group_path, path_hint.as_deref());
+            let seat_meta = state.seat_meta_by_guid.entry(sub_guid).or_default();
+            if seat_meta.vehicle_actor_guid.is_none() {
+                seat_meta.vehicle_actor_guid = actor_guid;
+            }
+            if seat_meta.vehicle_class.is_none() {
+                seat_meta.vehicle_class = actor_guid.and_then(|owner_actor_guid| {
+                    state
+                        .actor_builders
+                        .get(&owner_actor_guid)
+                        .and_then(|builder| {
+                            builder.class_name.clone().or_else(|| {
+                                builder.archetype_path.as_deref().and_then(normalize_type)
+                            })
+                        })
+                });
+            }
+            match context.property_name {
+                "AttachSocketName" => {
+                    if let Some(value) = meaningful_decoded_string(decoded) {
+                        seat_meta.attach_socket_name = Some(value);
+                    }
+                }
+                "SeatAttachSocket" => {
+                    if let Some(value) = meaningful_decoded_string(decoded) {
+                        seat_meta.seat_attach_socket = Some(value);
+                    }
+                }
+                _ => {}
+            }
             let retain_component_state = matches!(
                 context.property_name,
                 "Health" | "bIsEngineActive" | "Owner" | "Occupant" | "PlayerState" | "CurrentSeat"
@@ -2276,11 +2693,11 @@ fn apply_property_event(
                     second: (context.t_ms / 1000) as u32,
                     component_guid: Some(sub_guid),
                     owner_actor_guid: actor_guid,
-                    component_type,
+                    component_type: component_type.to_string(),
                     component_name: component_builder.and_then(|builder| builder.path_hint.clone()),
                     component_class: component_builder
                         .and_then(|builder| builder.component_class.clone())
-                        .or_else(|| Some(canonical_group_leaf(context.group_path))),
+                        .or_else(|| Some(canonical_group_leaf_ref(context.group_path).to_string())),
                     group_path: context.group_path.to_string(),
                     property_name: context.property_name.to_string(),
                     decoded: decoded.clone(),
@@ -2290,6 +2707,29 @@ fn apply_property_event(
                     value_string,
                 });
             }
+        }
+    }
+
+    if context.group_leaf == "SQPlayerState" && context.property_name == "CurrentSeat" {
+        let player_state_guid = actor_guid.filter(|guid| *guid != 0);
+        let component_guid = decoded_scalar_u32(decoded).filter(|guid| *guid != 0);
+        let seat_actor_guid = component_guid
+            .and_then(|guid| state.seat_meta_by_guid.get(&guid))
+            .and_then(|seat| seat.vehicle_actor_guid);
+        let dedup_key = (
+            context.t_ms,
+            seat_actor_guid,
+            component_guid,
+            player_state_guid,
+            context.property_name.to_string(),
+        );
+        if state.seen_seat_keys.insert(dedup_key) {
+            state.seat_change_candidates.push(SeatChangeCandidate {
+                t_ms: context.t_ms,
+                second: (context.t_ms / 1000) as u32,
+                component_guid,
+                player_state_guid,
+            });
         }
     }
 
@@ -2338,6 +2778,81 @@ fn apply_property_event(
             value_string,
         });
     }
+
+    if let Some(raw_actor_guid) = actor_guid {
+        let player_state_guid = if context.group_leaf == "SQPlayerState"
+            || context.group_path == "/Script/Squad.SQPlayerState"
+        {
+            Some(raw_actor_guid)
+        } else {
+            state.player_actor_to_state.get(&raw_actor_guid).copied()
+        };
+
+        if let Some(player_state_guid) = player_state_guid {
+            let mut emit_incap = false;
+            let mut emit_dead = false;
+            let death_state = state.kill_states.entry(player_state_guid).or_default();
+            match context.property_name {
+                "bIsIncapacitated" | "bIsUnconscious" | "bWounded" => {
+                    if decoded.boolean == Some(true) && death_state.incap != Some(true) {
+                        emit_incap = true;
+                    }
+                    death_state.incap = decoded.boolean;
+                }
+                "bIsDead" | "bIsKilled" => {
+                    if decoded.boolean == Some(true) && death_state.dead != Some(true) {
+                        emit_dead = true;
+                    }
+                    death_state.dead = decoded.boolean;
+                }
+                "Health" | "CurrentHealth" => {
+                    let next_health = decoded
+                        .float32
+                        .map(|value| value as f64)
+                        .or_else(|| decoded.int32.map(|value| value as f64))
+                        .or_else(|| decoded.int_packed.map(|value| value as f64));
+                    if let Some(next_health) = next_health {
+                        if death_state.health.unwrap_or(1.0) > 0.0 && next_health <= 0.0 {
+                            emit_dead = true;
+                        }
+                        death_state.health = Some(next_health);
+                    }
+                }
+                "LifeState" => {
+                    let next_state = decoded
+                        .int32
+                        .map(|value| value as i64)
+                        .or_else(|| decoded.int_packed.map(|value| value as i64));
+                    if let Some(next_state) = next_state {
+                        if next_state >= 2 {
+                            emit_dead = true;
+                        } else if next_state == 1 {
+                            emit_incap = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if emit_incap {
+                maybe_emit_kill(
+                    state,
+                    context.t_ms,
+                    (context.t_ms / 1000) as u32,
+                    player_state_guid,
+                    true,
+                );
+            }
+            if emit_dead {
+                maybe_emit_kill(
+                    state,
+                    context.t_ms,
+                    (context.t_ms / 1000) as u32,
+                    player_state_guid,
+                    false,
+                );
+            }
+        }
+    }
 }
 
 fn record_property_event(
@@ -2347,16 +2862,18 @@ fn record_property_event(
 ) {
     state.property_replications += 1;
     apply_property_event(state, context, &decoded);
-    state.property_events.push(PropertyEvent {
-        t_ms: context.t_ms,
-        second: (context.t_ms / 1000) as u32,
-        channel_index: context.channel_index,
-        actor_guid: context.actor.map(|value| value.actor_net_guid.value),
-        group_path: context.group_path.to_string(),
-        property_name: context.property_name.to_string(),
-        sub_object_net_guid: context.sub_object_net_guid,
-        decoded,
-    });
+    if state.retain_property_events {
+        state.property_events.push(PropertyEvent {
+            t_ms: context.t_ms,
+            second: (context.t_ms / 1000) as u32,
+            channel_index: context.channel_index,
+            actor_guid: context.actor.map(|value| value.actor_net_guid.value),
+            group_path: context.group_path.to_string(),
+            property_name: context.property_name.to_string(),
+            sub_object_net_guid: context.sub_object_net_guid,
+            decoded,
+        });
+    }
 }
 
 fn read_rep_layout_properties(
@@ -2367,6 +2884,7 @@ fn read_rep_layout_properties(
 ) {
     let group_leaf = infer_group_leaf(context.group_path);
     let actor_guid = context.actor.map(|value| value.actor_net_guid.value);
+    let is_helicopter_movement_component = group_leaf == "SQHelicopterMovementComponent";
     archive.skip_bits(1);
     let mut had_property_data = false;
     loop {
@@ -2393,9 +2911,7 @@ fn read_rep_layout_properties(
         had_property_data = true;
         let mut decoded =
             decode_generic_value(&payload_reader, &archive.header, export.name.as_str());
-        if export.name == "ReplicatedMovement"
-            && is_helicopter_movement_component_group(context.group_path)
-        {
+        if export.name == "ReplicatedMovement" && is_helicopter_movement_component {
             decoded.rep_movement =
                 decode_helicopter_component_rep_movement(payload_reader, &archive.header);
         }
@@ -2425,17 +2941,15 @@ fn read_rep_layout_properties(
                         external.payload.clone(),
                         external.payload.len() * 8,
                     );
-                    payload_reader.header = archive.header.clone();
-                    payload_reader.outer = archive.outer.clone();
+                    payload_reader.header = Arc::clone(&archive.header);
+                    payload_reader.outer = Arc::clone(&archive.outer);
 
                     let mut decoded = decode_generic_value(
                         &payload_reader,
                         &archive.header,
                         export.name.as_str(),
                     );
-                    if export.name == "ReplicatedMovement"
-                        && is_helicopter_movement_component_group(context.group_path)
-                    {
+                    if export.name == "ReplicatedMovement" && is_helicopter_movement_component {
                         decoded.rep_movement = decode_helicopter_component_rep_movement(
                             payload_reader,
                             &archive.header,
@@ -2443,8 +2957,7 @@ fn read_rep_layout_properties(
                     }
 
                     let t_ms = (context.time_seconds.max(0.0) as f64 * 1000.0).round() as u64;
-                    // Re-run side-channel payloads through the same projection path so
-                    // derived state stays consistent with inline property replication.
+                    // Run side-channel payloads through the same projection path.
                     record_property_event(
                         state,
                         PropertyContext {
@@ -2785,9 +3298,17 @@ fn received_next_bunch(mut bunch: Bunch, state: &mut ParseState) {
                 let bits_left = bunch.archive.get_bits_left();
                 if !bunch.b_has_package_export_maps && bits_left > 0 {
                     let payload = bunch.archive.read_bits(bits_left);
-                    partial
-                        .archive
-                        .append_data_from_checked(&payload, bits_left);
+                    // If the payload is short or already broken, drop the partial bunch.
+                    if bunch.archive.is_error
+                        || payload.len().saturating_mul(8) < bits_left
+                        || partial
+                            .archive
+                            .append_data_from_checked(&payload, bits_left)
+                            .is_err()
+                    {
+                        state.partial_bunch = None;
+                        return;
+                    }
                 }
                 partial.ch_sequence = bunch.ch_sequence;
                 if bunch.b_partial_final {
@@ -3046,7 +3567,13 @@ fn parse_playback_frame(replay: &mut BitReader, state: &mut ParseState) {
 
 fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3143,8 +3670,7 @@ fn reconstruct_anchored_helicopter_track(
     let mut accepted_samples = Vec::new();
     let mut last_world: Option<(u64, f64, f64, f64)> = None;
 
-    // Treat the actor open transform as the world-space anchor and offset later
-    // local samples relative to the first decoded movement payload.
+    // Use the actor open transform as the world-space anchor.
     for sample in ordered {
         let Some(local) = sample.movement.location else {
             continue;
@@ -3388,42 +3914,6 @@ fn finalize_roster_and_seats(
     state: &ParseState,
     players: &mut [Player],
 ) -> (Vec<Team>, Vec<Squad>, Vec<SeatChangeEvent>) {
-    #[derive(Debug, Clone, Default)]
-    struct TeamTemp {
-        id: Option<u32>,
-        team_state_guid: Option<u32>,
-        name: Option<String>,
-        faction_from_state: Option<String>,
-        faction_setup_id: Option<String>,
-        tickets: Option<u32>,
-        commander_state_guid: Option<u32>,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct SquadTemp {
-        id: Option<u32>,
-        raw_team_id: Option<u32>,
-        squad_state_guid: Option<u32>,
-        leader_player_state_guid: Option<u32>,
-        creator_player_state_guid: Option<u32>,
-        name: Option<String>,
-        leader_name: Option<String>,
-        leader_steam_id: Option<String>,
-        leader_eos_id: Option<String>,
-        creator_name: Option<String>,
-        creator_identity_raw: Option<String>,
-        creator_steam_id: Option<String>,
-        creator_eos_id: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct SeatMeta {
-        vehicle_actor_guid: Option<u32>,
-        vehicle_class: Option<String>,
-        seat_attach_socket: Option<String>,
-        attach_socket_name: Option<String>,
-    }
-
     let mut team_faction_counts: BTreeMap<u32, HashMap<String, usize>> = BTreeMap::new();
     for actor in state.actor_builders.values() {
         let Some(team_id) = actor
@@ -3453,58 +3943,14 @@ fn finalize_roster_and_seats(
         }
     }
 
-    let mut teams_by_actor_guid: BTreeMap<u32, TeamTemp> = BTreeMap::new();
-    let mut private_to_public_squad_guid: HashMap<u32, u32> = HashMap::new();
-
-    for event in &state.property_events {
-        let Some(actor_guid) = event.actor_guid else {
-            continue;
-        };
-        let group_leaf = canonical_group_leaf(&event.group_path);
-
-        if group_leaf == "SQSquadStatePrivateToTeam" && event.property_name == "SquadState" {
-            if let Some(public_guid) = decoded_scalar_u32(&event.decoded) {
-                private_to_public_squad_guid.insert(actor_guid, public_guid);
-            }
-        }
-
-        if group_leaf == "SQTeamState" || group_leaf == "SQTeamStatePrivate" {
-            let team = teams_by_actor_guid.entry(actor_guid).or_default();
-            team.team_state_guid.get_or_insert(actor_guid);
-
-            match event.property_name.as_str() {
-                "ID" => team.id = decoded_preferred_u32(&event.decoded),
-                "Tickets" => team.tickets = decoded_preferred_u32(&event.decoded),
-                "CommanderState" => team.commander_state_guid = decoded_scalar_u32(&event.decoded),
-                "Name" | "ShortName" | "DisplayName" => {
-                    if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                        team.name = Some(value);
-                    }
-                }
-                "FactionSetupId" => {
-                    if let Some(value) = decoded_scalar_string(&event.decoded) {
-                        team.faction_setup_id = Some(value.clone());
-                        team.faction_from_state = Some(value);
-                    }
-                }
-                "Faction" | "FactionId" | "FactionName" => {
-                    if let Some(value) = decoded_scalar_string(&event.decoded) {
-                        team.faction_from_state = Some(value);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     let mut known_team_ids: HashSet<u32> = faction_hint_by_team_id.keys().copied().collect();
-    for team in teams_by_actor_guid.values() {
+    for team in state.teams_by_actor_guid.values() {
         if let Some(team_id) = team.id {
             known_team_ids.insert(team_id);
         }
     }
 
-    let mut squads_by_state_guid: BTreeMap<u32, SquadTemp> = BTreeMap::new();
+    let mut squads_by_state_guid = state.public_squads_by_state_guid.clone();
     for player in players.iter() {
         if let Some(squad_state_guid) = player.squad_state_guid {
             squads_by_state_guid
@@ -3516,82 +3962,23 @@ fn finalize_roster_and_seats(
         }
     }
 
-    for event in &state.property_events {
-        let Some(actor_guid) = event.actor_guid else {
-            continue;
-        };
-        let group_leaf = canonical_group_leaf(&event.group_path);
-        if group_leaf != "SQSquadState" && group_leaf != "SQSquadStatePrivateToTeam" {
-            continue;
-        }
-
-        let squad_state_guid = private_to_public_squad_guid
-            .get(&actor_guid)
+    for (private_guid, private_squad) in &state.private_squads_by_actor_guid {
+        let Some(public_guid) = state
+            .private_to_public_squad_guid
+            .get(private_guid)
             .copied()
-            .or_else(|| (group_leaf == "SQSquadState").then_some(actor_guid))
-            .or_else(|| {
-                (event.property_name == "SquadState").then(|| decoded_scalar_u32(&event.decoded))?
-            });
-        let Some(squad_state_guid) = squad_state_guid else {
+        else {
             continue;
         };
-
         let squad = squads_by_state_guid
-            .entry(squad_state_guid)
+            .entry(public_guid)
             .or_insert_with(|| SquadTemp {
-                squad_state_guid: Some(squad_state_guid),
+                squad_state_guid: Some(public_guid),
                 ..SquadTemp::default()
             });
-
-        match event.property_name.as_str() {
-            "ID" => squad.id = decoded_preferred_u32(&event.decoded),
-            "Team" | "TeamId" | "TeamState" => {
-                squad.raw_team_id = decoded_preferred_u32(&event.decoded);
-            }
-            "Name" | "SquadName" | "DisplayName" => {
-                if let Some(value) = decoded_scalar_string(&event.decoded) {
-                    squad.name = Some(value);
-                }
-            }
-            "Leader" | "LeaderState" | "LeaderPlayerState" => {
-                squad.leader_player_state_guid = decoded_scalar_u32(&event.decoded);
-            }
-            "Creator" | "CreatorPlayerState" => {
-                squad.creator_player_state_guid = decoded_scalar_u32(&event.decoded);
-            }
-            "LeaderName" => {
-                if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                    squad.leader_name = Some(value);
-                }
-            }
-            "CreatorName" | "SquadCreatorName" => {
-                if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                    squad.creator_name = Some(value);
-                }
-            }
-            "SquadCreatorSteamID" => {
-                if let Some(raw) = meaningful_decoded_string(&event.decoded) {
-                    squad.creator_identity_raw = Some(raw.clone());
-                    let parsed = parse_identity_blob(&raw);
-                    if squad.creator_steam_id.is_none() {
-                        squad.creator_steam_id = parsed.steam_id;
-                    }
-                    if squad.creator_eos_id.is_none() {
-                        squad.creator_eos_id = parsed.eos_id;
-                    }
-                }
-            }
-            "CreatorSteamId" => {
-                if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                    squad.creator_steam_id = Some(value);
-                }
-            }
-            "CreatorEOSId" | "CreatorEosId" | "CreatorEpicId" => {
-                if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                    squad.creator_eos_id = Some(value);
-                }
-            }
-            _ => {}
+        merge_squad_temp(squad, private_squad.clone());
+        if squad.squad_state_guid.is_none() {
+            squad.squad_state_guid = Some(public_guid);
         }
     }
 
@@ -3677,7 +4064,7 @@ fn finalize_roster_and_seats(
         );
     }
 
-    for team in teams_by_actor_guid.values() {
+    for team in state.teams_by_actor_guid.values() {
         let Some(team_id) = team.id else {
             continue;
         };
@@ -3843,8 +4230,6 @@ fn finalize_roster_and_seats(
         }
     }
 
-    let mut seen_seat_keys: HashSet<SeenSeatKey> = HashSet::new();
-    let mut seat_changes: Vec<SeatChangeEvent> = Vec::new();
     let player_name_by_state = players
         .iter()
         .filter_map(|player| {
@@ -3854,95 +4239,39 @@ fn finalize_roster_and_seats(
                 .map(|name| (player.player_state_guid, name.clone()))
         })
         .collect::<HashMap<_, _>>();
-    let current_seat_guids = state
-        .property_events
+    let mut seat_changes: Vec<SeatChangeEvent> = state
+        .seat_change_candidates
         .iter()
-        .filter(|event| {
-            canonical_group_leaf(&event.group_path) == "SQPlayerState"
-                && event.property_name == "CurrentSeat"
-        })
-        .filter_map(|event| decoded_scalar_u32(&event.decoded).filter(|guid| *guid != 0))
-        .collect::<HashSet<_>>();
-    let mut seat_meta_by_guid: HashMap<u32, SeatMeta> = HashMap::new();
-    for event in &state.property_events {
-        if let Some(sub_guid) = event.sub_object_net_guid {
-            if Some(sub_guid) != event.actor_guid {
-                let path_hint = state.guid_to_path.get(&sub_guid).map(String::as_str);
-                let is_seat_component = infer_component_type(&event.group_path, path_hint)
-                    == "seat"
-                    || current_seat_guids.contains(&sub_guid);
-                if is_seat_component {
-                    let seat = seat_meta_by_guid.entry(sub_guid).or_default();
-                    seat.vehicle_actor_guid = event.actor_guid;
-                    if seat.vehicle_class.is_none() {
-                        seat.vehicle_class = event.actor_guid.and_then(|actor_guid| {
-                            state.actor_builders.get(&actor_guid).and_then(|builder| {
-                                builder.class_name.clone().or_else(|| {
-                                    builder.archetype_path.as_deref().and_then(normalize_type)
-                                })
-                            })
-                        });
-                    }
-                    match event.property_name.as_str() {
-                        "AttachSocketName" => {
-                            if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                                seat.attach_socket_name = Some(value);
-                            }
-                        }
-                        "SeatAttachSocket" => {
-                            if let Some(value) = meaningful_decoded_string(&event.decoded) {
-                                seat.seat_attach_socket = Some(value);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        if canonical_group_leaf(&event.group_path) != "SQPlayerState"
-            || event.property_name != "CurrentSeat"
-        {
-            continue;
-        }
-
-        let player_state_guid = event.actor_guid.filter(|guid| *guid != 0);
-        let component_guid = decoded_scalar_u32(&event.decoded).filter(|guid| *guid != 0);
-        let seat = component_guid.and_then(|guid| seat_meta_by_guid.get(&guid).cloned());
-        let dedup_key = (
-            event.t_ms,
-            seat.as_ref().and_then(|value| value.vehicle_actor_guid),
-            component_guid,
-            player_state_guid,
-            event.property_name.clone(),
-        );
-        if seen_seat_keys.insert(dedup_key) {
-            seat_changes.push(SeatChangeEvent {
-                t_ms: event.t_ms,
-                second: event.second,
-                actor_guid: seat.as_ref().and_then(|value| value.vehicle_actor_guid),
-                component_guid,
-                player_state_guid,
-                vehicle_class: seat.as_ref().and_then(|value| value.vehicle_class.clone()),
-                seat_attach_socket: seat.as_ref().and_then(|value| {
+        .map(|candidate| {
+            let seat = candidate
+                .component_guid
+                .and_then(|guid| state.seat_meta_by_guid.get(&guid));
+            SeatChangeEvent {
+                t_ms: candidate.t_ms,
+                second: candidate.second,
+                actor_guid: seat.and_then(|value| value.vehicle_actor_guid),
+                component_guid: candidate.component_guid,
+                player_state_guid: candidate.player_state_guid,
+                vehicle_class: seat.and_then(|value| value.vehicle_class.clone()),
+                seat_attach_socket: seat.and_then(|value| {
                     value
                         .seat_attach_socket
                         .clone()
                         .or_else(|| value.attach_socket_name.clone())
                 }),
-                attach_socket_name: seat
-                    .as_ref()
-                    .and_then(|value| value.attach_socket_name.clone()),
-                occupant_name: player_state_guid
+                attach_socket_name: seat.and_then(|value| value.attach_socket_name.clone()),
+                occupant_name: candidate
+                    .player_state_guid
                     .and_then(|guid| player_name_by_state.get(&guid).cloned()),
                 value: Some(
-                    component_guid
+                    candidate
+                        .component_guid
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "0".to_string()),
                 ),
-            });
-        }
-    }
+            }
+        })
+        .collect();
 
     let mut teams = teams_by_id.into_values().collect::<Vec<_>>();
     teams.sort_by_key(|team| team.id);
@@ -3953,110 +4282,63 @@ fn finalize_roster_and_seats(
 }
 
 fn finalize_kills(state: &ParseState, players: &[Player]) -> Vec<KillEvent> {
-    #[derive(Debug, Clone, Default)]
-    struct DeathState {
-        dead: Option<bool>,
-        incap: Option<bool>,
-        health: Option<f64>,
-    }
-
-    let mut player_name_by_state: HashMap<u32, String> = HashMap::new();
-    let mut actor_to_player_state: HashMap<u32, u32> = HashMap::new();
-    for player in players {
-        if let Some(name) = &player.name {
-            player_name_by_state.insert(player.player_state_guid, name.clone());
-        }
-        if let Some(guid) = player.soldier_guid {
-            actor_to_player_state.insert(guid, player.player_state_guid);
-        }
-        if let Some(guid) = player.current_pawn_guid {
-            actor_to_player_state.insert(guid, player.player_state_guid);
-        }
-    }
-
-    let mut events: Vec<KillEvent> = Vec::new();
-    let mut states: HashMap<u32, DeathState> = HashMap::new();
-    let mut dedup: HashSet<(u64, u32, bool)> = HashSet::new();
-    for event in &state.property_events {
-        let leaf = infer_group_leaf(&event.group_path);
-        let Some(raw_actor_guid) = event.actor_guid else {
-            continue;
-        };
-        let player_state_guid =
-            if leaf == "SQPlayerState" || event.group_path == "/Script/Squad.SQPlayerState" {
-                raw_actor_guid
-            } else if let Some(mapped) = actor_to_player_state.get(&raw_actor_guid).copied() {
-                mapped
-            } else {
-                continue;
-            };
-
-        let mut emit = |was_incap: bool| {
-            let key = (event.t_ms / 1000, player_state_guid, was_incap);
-            if dedup.insert(key) {
-                events.push(KillEvent {
-                    t_ms: event.t_ms,
-                    second: event.second,
-                    victim_name: player_name_by_state.get(&player_state_guid).cloned(),
-                    killer_name: None,
-                    victim_guid: Some(player_state_guid),
-                    killer_guid: None,
-                    was_incap: Some(was_incap),
-                });
-            }
-        };
-
-        let death_state = states.entry(player_state_guid).or_default();
-        match event.property_name.as_str() {
-            "bIsIncapacitated" | "bIsUnconscious" | "bWounded" => {
-                if event.decoded.boolean == Some(true) && death_state.incap != Some(true) {
-                    emit(true);
-                }
-                death_state.incap = event.decoded.boolean;
-            }
-            "bIsDead" | "bIsKilled" => {
-                if event.decoded.boolean == Some(true) && death_state.dead != Some(true) {
-                    emit(false);
-                }
-                death_state.dead = event.decoded.boolean;
-            }
-            "Health" | "CurrentHealth" => {
-                let next_health = event
-                    .decoded
-                    .float32
-                    .map(|value| value as f64)
-                    .or_else(|| event.decoded.int32.map(|value| value as f64))
-                    .or_else(|| event.decoded.int_packed.map(|value| value as f64));
-                if let Some(next_health) = next_health {
-                    if death_state.health.unwrap_or(1.0) > 0.0 && next_health <= 0.0 {
-                        emit(false);
-                    }
-                    death_state.health = Some(next_health);
-                }
-            }
-            "LifeState" => {
-                let next_state = event
-                    .decoded
-                    .int32
-                    .map(|value| value as i64)
-                    .or_else(|| event.decoded.int_packed.map(|value| value as i64));
-                if let Some(next_state) = next_state {
-                    if next_state >= 2 {
-                        emit(false);
-                    } else if next_state == 1 {
-                        emit(true);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let player_name_by_state = players
+        .iter()
+        .filter_map(|player| {
+            player
+                .name
+                .as_ref()
+                .map(|name| (player.player_state_guid, name.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut events: Vec<KillEvent> = state
+        .kill_candidates
+        .iter()
+        .map(|candidate| KillEvent {
+            t_ms: candidate.t_ms,
+            second: candidate.second,
+            victim_name: player_name_by_state.get(&candidate.victim_guid).cloned(),
+            killer_name: None,
+            victim_guid: Some(candidate.victim_guid),
+            killer_guid: None,
+            was_incap: Some(candidate.was_incap),
+        })
+        .collect();
 
     events.sort_by_key(|event| (event.t_ms, event.victim_guid.unwrap_or_default()));
     events
 }
 
-pub(crate) fn parse_file(path: impl AsRef<Path>) -> Result<Bundle> {
+fn parse_replay_stream(
+    data: &Arc<Vec<u8>>,
+    header: &Arc<DemoHeader>,
+    outer: &Arc<OuterInfo>,
+    replay_data_chunks: &[ReplayDataChunk],
+    retain_property_events: bool,
+) -> ParseState {
+    let mut state = ParseState {
+        retain_property_events,
+        ..ParseState::default()
+    };
+
+    for chunk in replay_data_chunks {
+        let mut replay = BitReader::new(Arc::clone(data));
+        replay.header = Arc::clone(header);
+        replay.outer = Arc::clone(outer);
+        replay.go_to_byte(chunk.start_pos);
+        let _ = replay.add_offset_byte(1, chunk.length as usize);
+
+        while !replay.at_end() {
+            parse_playback_frame(&mut replay, &mut state);
+        }
+
+        let _ = replay.pop_offset(1, true);
+    }
+
+    state
+}
+
+pub(crate) fn parse_file(path: impl AsRef<Path>, retain_property_events: bool) -> Result<Bundle> {
     let path = path.as_ref();
     let data = Arc::new(fs::read(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -4066,17 +4348,26 @@ pub(crate) fn parse_file(path: impl AsRef<Path>) -> Result<Bundle> {
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown.replay".to_string());
-    parse_data(data, file_name)
+    parse_data(data, file_name, retain_property_events)
 }
 
-pub(crate) fn parse_bytes(bytes: &[u8], file_name: Option<String>) -> Result<Bundle> {
+pub(crate) fn parse_bytes(
+    bytes: &[u8],
+    file_name: Option<String>,
+    retain_property_events: bool,
+) -> Result<Bundle> {
     parse_data(
         Arc::new(bytes.to_vec()),
         file_name.unwrap_or_else(|| "unknown.replay".to_string()),
+        retain_property_events,
     )
 }
 
-fn parse_data(data: Arc<Vec<u8>>, file_name: String) -> Result<Bundle> {
+fn parse_data(
+    data: Arc<Vec<u8>>,
+    file_name: String,
+    retain_property_events: bool,
+) -> Result<Bundle> {
     let (outer, header, replay_data_chunks) = parse_wrapper(data.as_ref().as_slice())?;
 
     if outer.is_encrypted {
@@ -4091,24 +4382,26 @@ fn parse_data(data: Arc<Vec<u8>>, file_name: String) -> Result<Bundle> {
         ));
     }
 
-    let mut state = ParseState::default();
-    let mut string_inventory = build_string_inventory(data.as_ref().as_slice());
-
-    for chunk in &replay_data_chunks {
-        // Replay data chunks are bounded byte ranges inside the wrapper. Each chunk
-        // gets its own reader and contributes to the same parser state.
-        let mut replay = BitReader::new(Arc::clone(&data));
-        replay.header = header.clone();
-        replay.outer = outer.clone();
-        replay.go_to_byte(chunk.start_pos);
-        let _ = replay.add_offset_byte(1, chunk.length as usize);
-
-        while !replay.at_end() {
-            parse_playback_frame(&mut replay, &mut state);
-        }
-
-        let _ = replay.pop_offset(1, true);
-    }
+    let outer = Arc::new(outer);
+    let header = Arc::new(header);
+    let (mut state, ((mut string_inventory, sha256), replay_chunk_count)) = join(
+        || {
+            parse_replay_stream(
+                &data,
+                &header,
+                &outer,
+                &replay_data_chunks,
+                retain_property_events,
+            )
+        },
+        || {
+            let metadata = join(
+                || build_string_inventory(data.as_ref().as_slice()),
+                || sha256_hex(data.as_ref().as_slice()),
+            );
+            (metadata, replay_data_chunks.len())
+        },
+    );
 
     let tracks = finalize_tracks(&mut state);
 
@@ -4217,7 +4510,7 @@ fn parse_data(data: Arc<Vec<u8>>, file_name: String) -> Result<Bundle> {
             source: ReplaySourceInfo {
                 file_name,
                 size_bytes: data.len() as u64,
-                sha256: sha256_hex(data.as_ref().as_slice()),
+                sha256,
             },
             engine: ReplayEngineInfo {
                 engine_version: Some(format!(
@@ -4264,7 +4557,7 @@ fn parse_data(data: Arc<Vec<u8>>, file_name: String) -> Result<Bundle> {
             property_replications: state.property_replications,
             position_samples: state.raw_player_samples.len() as u64,
             vehicle_position_samples: state.raw_vehicle_samples.len() as u64,
-            replay_data_chunks: replay_data_chunks.len(),
+            replay_data_chunks: replay_chunk_count,
             warnings: state.warnings,
             string_inventory,
             provenance_report: canonical_provenance_report(),
@@ -4277,6 +4570,7 @@ fn parse_data(data: Arc<Vec<u8>>, file_name: String) -> Result<Bundle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn cleaned_text_rejects_replacement_and_control_chars() {
@@ -4357,17 +4651,17 @@ mod tests {
         let movement_group = "/Script/Squad.SQHelicopterMovementComponent".to_string();
         state.groups_by_path.insert(
             actor_path.clone(),
-            ExportGroup {
+            Arc::new(ExportGroup {
                 path_name: actor_path.clone(),
                 ..ExportGroup::default()
-            },
+            }),
         );
         state.groups_by_path.insert(
             movement_group.clone(),
-            ExportGroup {
+            Arc::new(ExportGroup {
                 path_name: movement_group.clone(),
                 ..ExportGroup::default()
-            },
+            }),
         );
         state.guid_to_path.insert(966, actor_path.clone());
         state
@@ -4493,11 +4787,11 @@ mod tests {
     #[test]
     fn primary_helicopter_rep_movement_decodes_known_loach_payload() {
         let payload = decode_test_hex("d51a48473c3683f97f104198fa8f8abdea08");
-        let header = DemoHeader {
+        let header = Arc::new(DemoHeader {
             engine_network_version: 36,
             network_version: 19,
             ..DemoHeader::default()
-        };
+        });
 
         let movement =
             decode_helicopter_component_rep_movement(BitReader::with_bounds(payload, 141), &header)
@@ -4520,6 +4814,14 @@ mod tests {
         assert_eq!(linear_velocity.y, 0.2);
         assert_eq!(linear_velocity.z, -0.4);
         assert!(movement.rep_physics);
+    }
+
+    #[test]
+    fn read_bits_to_unsigned_int_handles_40_bit_windows() {
+        let payload = vec![0xff; 5];
+        let mut reader = BitReader::with_bounds(payload, 40);
+        assert_eq!(reader.read_bits_to_unsigned_int(40), (1u64 << 40) - 1);
+        assert!(!reader.is_error);
     }
 
     #[test]
@@ -4596,7 +4898,7 @@ mod tests {
             return;
         }
 
-        let bundle = parse_file(&fixture).expect("fixture replay should parse");
+        let bundle = parse_file(&fixture, true).expect("fixture replay should parse");
         assert_eq!(bundle.schema.version, 1);
         assert_eq!(bundle.teams.len(), 2);
         assert_eq!(bundle.squads.len(), 1);
@@ -4867,5 +5169,144 @@ mod tests {
         assert!(helicopter_keys.contains("LOACH_3764"));
         assert!(!helicopter_keys.contains("HELICOPTER_972"));
         assert!(!helicopter_keys.contains("HELICOPTER_978"));
+    }
+
+    // Oversized length regressions.
+
+    fn reader_from_bytes(bytes: Vec<u8>) -> BitReader {
+        // Match packet sub-reader setup.
+        let bit_count = bytes.len() * 8;
+        BitReader::with_bounds(bytes, bit_count)
+    }
+
+    #[test]
+    fn read_string_rejects_i32_min_length_without_allocating_giants() {
+        // Bad UTF-16 length, tiny payload.
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x80]; // length prefix
+        bytes.extend_from_slice(&[0, 0, 0, 0]);      // padding
+        let mut reader = reader_from_bytes(bytes);
+        let start = std::time::Instant::now();
+        let s = reader.read_string();
+        let elapsed = start.elapsed();
+        assert!(reader.is_error, "malformed length should set is_error");
+        assert!(s.is_empty(), "malformed length should return empty string");
+        assert!(
+            elapsed.as_millis() < 50,
+            "read_string should fail fast, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn read_string_rejects_i32_max_length_without_allocating_giants() {
+        // Bad UTF-8 length that overflows the bit count.
+        let mut bytes = vec![0xff, 0xff, 0xff, 0x7f]; // i32::MAX LE
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        let mut reader = reader_from_bytes(bytes);
+        let start = std::time::Instant::now();
+        let s = reader.read_string();
+        let elapsed = start.elapsed();
+        assert!(reader.is_error);
+        assert!(s.is_empty());
+        assert!(
+            elapsed.as_millis() < 50,
+            "read_string should fail fast, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn read_string_rejects_negative_one_length_against_tiny_buffer() {
+        // UTF-16 length marker with no payload behind it.
+        let bytes = vec![0xff, 0xff, 0xff, 0xff]; // -1 LE, nothing after
+        let mut reader = reader_from_bytes(bytes);
+        let s = reader.read_string();
+        assert!(reader.is_error);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn read_string_decodes_legitimate_short_utf8() {
+        // Normal UTF-8 string plus trailing NUL.
+        let mut bytes = vec![4, 0, 0, 0];
+        bytes.extend_from_slice(b"abc\0");
+        let mut reader = reader_from_bytes(bytes);
+        let s = reader.read_string();
+        assert!(!reader.is_error, "legitimate read should not error");
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn read_bytes_rejects_oversize_count_without_allocating_giants() {
+        // Asking for too much data should fail before allocation.
+        let bytes = vec![0u8; 16];
+        let mut reader = reader_from_bytes(bytes);
+        let start = std::time::Instant::now();
+        let out = reader.read_bytes(usize::MAX / 16);
+        let elapsed = start.elapsed();
+        assert!(reader.is_error);
+        assert!(out.is_empty());
+        assert!(
+            elapsed.as_millis() < 50,
+            "read_bytes should fail fast, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn read_bytes_rejects_count_that_overflows_bits() {
+        // `byte_count * 8` should overflow cleanly here.
+        let bytes = vec![0u8; 16];
+        let mut reader = reader_from_bytes(bytes);
+        let out = reader.read_bytes(usize::MAX);
+        assert!(reader.is_error);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn read_bits_rejects_oversize_count_without_allocating_giants() {
+        let bytes = vec![0u8; 16];
+        let mut reader = reader_from_bytes(bytes);
+        let start = std::time::Instant::now();
+        let out = reader.read_bits(usize::MAX);
+        let elapsed = start.elapsed();
+        assert!(reader.is_error);
+        assert!(out.is_empty());
+        assert!(
+            elapsed.as_millis() < 50,
+            "read_bits should fail fast, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn with_bounds_clamps_bit_count_to_actual_data_length() {
+        // Clamp to the real buffer size.
+        let reader = BitReader::with_bounds(vec![0u8; 4], 1_000_000);
+        assert_eq!(reader.last_bit, 32);
+    }
+
+    #[test]
+    fn append_data_from_checked_rejects_torn_partial_bunch() {
+        // Do not extend past appended bytes.
+        let mut reader = BitReader::with_bounds(vec![0u8; 4], 32);
+        let before_last_bit = reader.last_bit;
+        let result = reader.append_data_from_checked(&[0x00], 1_000_000);
+        assert!(result.is_err());
+        assert!(reader.is_error);
+        assert_eq!(reader.last_bit, before_last_bit);
+    }
+
+    #[test]
+    fn append_data_from_checked_accepts_exact_match() {
+        let mut reader = BitReader::with_bounds(vec![0u8; 4], 32);
+        let result = reader.append_data_from_checked(&[0xab, 0xcd], 16);
+        assert!(result.is_ok());
+        assert_eq!(reader.last_bit, 48);
+        assert_eq!(reader.data.len(), 6);
+    }
+
+    #[test]
+    fn can_read_handles_overflowing_bit_count() {
+        let reader = BitReader::with_bounds(vec![0u8; 4], 32);
+        assert!(!reader.can_read(usize::MAX));
+        assert!(reader.can_read(32));
+        assert!(reader.can_read(0));
     }
 }
