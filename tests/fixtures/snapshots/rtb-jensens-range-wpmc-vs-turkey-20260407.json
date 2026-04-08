@@ -6,8 +6,19 @@
   },
   "replay": {
     "map_name": "/Game/Maps/Jensens_Range/Gameplay_Layers/Jensens_Range_WPMC-TLF",
+    "layer_name": "Jensens_Range_WPMC-TLF",
+    "friendly_name": "more-testing",
     "squad_version": "//Squad/v10.3.1",
     "duration_ms": 610661
+  },
+  "game_state": {
+    "server_name": null,
+    "game_mode": null,
+    "match_state": null,
+    "max_players": null,
+    "is_ticket_based": null,
+    "server_tags_count": 0,
+    "layer_rotation_count": 0
   },
   "counts": {
     "teams": 2,
@@ -18,7 +29,7 @@
     "vehicles": 23,
     "helicopters": 9,
     "deployables": 52,
-    "components": 409
+    "components": 410
   },
   "tracks": {
     "players": {
@@ -36,12 +47,12 @@
   },
   "events": {
     "kills": 3,
-    "deployments": 52,
+    "deployments": 57,
     "seat_changes": 9,
     "component_states": 740,
     "vehicle_states": 377,
     "weapon_states": 0,
-    "properties": 50682
+    "properties": 51697
   },
   "diagnostics": {
     "frames_processed": 38937,
@@ -49,7 +60,7 @@
     "actor_opens": 714,
     "export_groups_discovered": 277,
     "guid_to_path_size": 2498,
-    "property_replications": 50682,
+    "property_replications": 51697,
     "position_samples": 1731,
     "vehicle_position_samples": 20065,
     "replay_data_chunks": 41,
@@ -65,7 +76,7 @@
     "positions_seconds": 601,
     "helicopter_positions_seconds": 611,
     "vehicle_positions_seconds": 611,
-    "deployable_events": 52
+    "deployable_events": 57
   },
   "players": [
     {

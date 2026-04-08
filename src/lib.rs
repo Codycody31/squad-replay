@@ -24,7 +24,7 @@ pub mod sqrb;
 pub mod sqrj;
 mod unreal_names;
 
-pub use bundle::{Bundle, ParseOptions};
+pub use bundle::{Bundle, GameStateInfo, ParseOptions};
 pub use error::{Error, Result};
 
 /// Parse a replay file from disk.

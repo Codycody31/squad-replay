@@ -20,8 +20,7 @@
 mod common;
 
 use common::{
-    FIXTURES, FixtureSnapshot, assert_snapshot_matches, fixtures_root,
-    update_snapshots_requested,
+    FIXTURES, FixtureSnapshot, assert_snapshot_matches, fixtures_root, update_snapshots_requested,
 };
 use squadreplay::{ParseOptions, parse_file};
 

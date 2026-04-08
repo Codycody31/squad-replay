@@ -51,6 +51,7 @@ enum SectionId {
     WeaponStates = 17,
     Properties = 18,
     Diagnostics = 19,
+    GameState = 20,
 }
 
 #[derive(Debug, Clone)]
@@ -155,11 +156,9 @@ where
         flags |= 0x0004;
         // CountingCrcWriter sits above zstd so raw_len and crc32 reflect
         // pre-compression bytes, matching the sqrb header contract.
-        let mut zstd_encoder = zstd::stream::Encoder::new(
-            Vec::<u8>::with_capacity(64 * 1024),
-            SQRB_ZSTD_LEVEL,
-        )
-        .map_err(|source| Error::Message(format!("zstd encode init failed: {source}")))?;
+        let mut zstd_encoder =
+            zstd::stream::Encoder::new(Vec::<u8>::with_capacity(64 * 1024), SQRB_ZSTD_LEVEL)
+                .map_err(|source| Error::Message(format!("zstd encode init failed: {source}")))?;
         if zstd_mt_workers > 0 {
             zstd_encoder
                 .multithread(zstd_mt_workers)
@@ -316,13 +315,38 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
         msgpack_section(SectionId::Components, false, 0, &bundle.actors.components),
         msgpack_section(SectionId::PlayerTracks, true, 0, &bundle.tracks.players),
         msgpack_section(SectionId::VehicleTracks, true, 0, &bundle.tracks.vehicles),
-        msgpack_section(SectionId::HelicopterTracks, true, 0, &bundle.tracks.helicopters),
+        msgpack_section(
+            SectionId::HelicopterTracks,
+            true,
+            0,
+            &bundle.tracks.helicopters,
+        ),
         msgpack_section(SectionId::Kills, false, 0, &bundle.events.kills),
         msgpack_section(SectionId::Deployments, false, 0, &bundle.events.deployments),
-        msgpack_section(SectionId::SeatChanges, false, 0, &bundle.events.seat_changes),
-        msgpack_section(SectionId::ComponentStates, true, 0, &bundle.events.component_states),
-        msgpack_section(SectionId::VehicleStates, true, 0, &bundle.events.vehicle_states),
-        msgpack_section(SectionId::WeaponStates, true, 0, &bundle.events.weapon_states),
+        msgpack_section(
+            SectionId::SeatChanges,
+            false,
+            0,
+            &bundle.events.seat_changes,
+        ),
+        msgpack_section(
+            SectionId::ComponentStates,
+            true,
+            0,
+            &bundle.events.component_states,
+        ),
+        msgpack_section(
+            SectionId::VehicleStates,
+            true,
+            0,
+            &bundle.events.vehicle_states,
+        ),
+        msgpack_section(
+            SectionId::WeaponStates,
+            true,
+            0,
+            &bundle.events.weapon_states,
+        ),
         // Properties is the only section big enough to repay the cost of
         // spinning up zstd's worker pool.
         msgpack_section(
@@ -332,6 +356,7 @@ pub(crate) fn write_sqrb(bundle: &Bundle, path: impl AsRef<Path>) -> Result<()> 
             &bundle.events.properties,
         ),
         msgpack_section_single(SectionId::Diagnostics, false, &bundle.diagnostics),
+        msgpack_section_single(SectionId::GameState, false, &bundle.game_state),
     ];
     let section_count = sections.len() as u32;
 
@@ -549,6 +574,7 @@ pub(crate) fn read_sqrb(path: impl AsRef<Path>) -> Result<Bundle> {
             17 => bundle.events.weapon_states = from_msgpack_slice(&raw)?,
             18 => bundle.events.properties = from_msgpack_slice(&raw)?,
             19 => bundle.diagnostics = from_msgpack_slice(&raw)?,
+            20 => bundle.game_state = from_msgpack_slice(&raw)?,
             _ => {}
         }
     }

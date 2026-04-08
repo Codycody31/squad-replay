@@ -6,8 +6,19 @@
   },
   "replay": {
     "map_name": "/Game/Maps/Fallujah_City/Gameplay_Layers/Fallujah_Seed_v1",
+    "layer_name": "Fallujah_Seed_v1",
+    "friendly_name": "rtb-fallujah-20260406",
     "squad_version": "//Squad/v10.3.1",
     "duration_ms": 1606368
+  },
+  "game_state": {
+    "server_name": null,
+    "game_mode": null,
+    "match_state": null,
+    "max_players": null,
+    "is_ticket_based": false,
+    "server_tags_count": 0,
+    "layer_rotation_count": 0
   },
   "counts": {
     "teams": 2,
@@ -18,7 +29,7 @@
     "vehicles": 0,
     "helicopters": 0,
     "deployables": 6,
-    "components": 2283
+    "components": 2296
   },
   "tracks": {
     "players": {
@@ -41,7 +52,7 @@
     "component_states": 0,
     "vehicle_states": 0,
     "weapon_states": 0,
-    "properties": 1303422
+    "properties": 1307252
   },
   "diagnostics": {
     "frames_processed": 102560,
@@ -49,7 +60,7 @@
     "actor_opens": 1970,
     "export_groups_discovered": 112,
     "guid_to_path_size": 5464,
-    "property_replications": 1303422,
+    "property_replications": 1307252,
     "position_samples": 8146,
     "vehicle_position_samples": 0,
     "replay_data_chunks": 107,

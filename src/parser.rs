@@ -1,9 +1,9 @@
 use crate::bundle::{
     ActorEntity, ActorGroups, Bundle, ComponentEntity, ComponentStateEvent, DecodedPropertyValue,
-    DeploymentEvent, Diagnostics, EventGroups, KillEvent, Player, PropertyEvent, ProvenanceEntry,
-    RepMovement, ReplayEngineInfo, ReplayInfoSection, ReplaySourceInfo, Rotator, SchemaInfo,
-    SeatChangeEvent, Squad, StringInventory, Team, Track3, TrackGroups, TrackSample3, Vec3,
-    VehicleStateEvent, WeaponStateEvent,
+    DeploymentEvent, Diagnostics, EventGroups, GameStateInfo, KillEvent, Player, PropertyEvent,
+    ProvenanceEntry, RepMovement, ReplayEngineInfo, ReplayInfoSection, ReplaySourceInfo, Rotator,
+    SchemaInfo, SeatChangeEvent, Squad, StringInventory, Team, Track3, TrackGroups, TrackSample3,
+    Vec3, VehicleStateEvent, WeaponStateEvent,
 };
 use crate::classify::{
     ClassifyFlags, classify_deployable_event_type, infer_component_type_name, infer_group_leaf,
@@ -267,6 +267,10 @@ struct ParseState {
     groups_by_leaf: HashMap<String, String>,
     groups_by_index: U32HashMap<String>,
     guid_to_path: U32HashMap<String>,
+    // Maps a channel index to its last successfully resolved export group.
+    // Lets us process actor-less channels (e.g. game state on late-join
+    // recordings) by reusing the group from the first successful match.
+    channel_group_cache: U32HashMap<Arc<ExportGroup>>,
     channels: U32HashMap<ChannelState>,
     ignored_channels: U32HashMap<bool>,
     actor_to_channel: U32HashMap<u32>,
@@ -314,6 +318,7 @@ struct ParseState {
     actor_opens: u64,
     property_replications: u64,
     warnings: Vec<String>,
+    game_state: GameStateTemp,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -351,6 +356,63 @@ struct SquadTemp {
     creator_identity_raw: Option<String>,
     creator_steam_id: Option<String>,
     creator_eos_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GameStateTemp {
+    server_name: Option<String>,
+    game_mode: Option<String>,
+    match_state: Option<String>,
+    match_id: Option<String>,
+    map_name: Option<String>,
+    max_players: Option<u32>,
+    motd: Option<String>,
+    server_tick_rate: Option<f32>,
+    server_start_timestamp: Option<String>,
+    startup_layer: Option<String>,
+    is_ticket_based: Option<bool>,
+    authority_num_teams: Option<u32>,
+    num_reserved_slots: Option<u32>,
+    public_queue_limit: Option<u32>,
+    num_players_diff_for_team_changes: Option<u32>,
+    low_player_count_threshold: Option<u32>,
+    community_admin_access: Option<bool>,
+    no_team_change_timer: Option<f32>,
+    server_message_interval: Option<f32>,
+    time_between_matches: Option<f32>,
+    time_before_vote: Option<f32>,
+    map_rotation_mode: Option<u32>,
+    use_vote_level: Option<bool>,
+    use_vote_layer: Option<bool>,
+    layer_options_number: Option<u32>,
+    faction_options_number: Option<u32>,
+    map_skip_rounds: Option<u32>,
+    layer_skip_rounds: Option<u32>,
+    faction_skip_rounds: Option<u32>,
+    faction_setup_skip_rounds: Option<u32>,
+    display_votes: Option<bool>,
+    unique_map_vote: Option<bool>,
+    vehicle_claiming_disabled: Option<bool>,
+    commander_disabled: Option<bool>,
+    force_all_role_availability: Option<bool>,
+    helicopters_available: Option<bool>,
+    boats_available: Option<bool>,
+    tanks_available: Option<bool>,
+    force_all_vehicle_availability: Option<bool>,
+    force_all_deployable_availability: Option<bool>,
+    force_all_action_availability: Option<bool>,
+    force_allow_commander_actions: Option<bool>,
+    force_no_commander_cooldowns: Option<bool>,
+    no_respawn_timer: Option<bool>,
+    vehicle_team_requirement_disabled: Option<bool>,
+    vehicle_kit_requirement_disabled: Option<bool>,
+    server_tags: Vec<String>,
+    level_rotation: Vec<String>,
+    layer_rotation: Vec<String>,
+    layer_rotation_low_players: Vec<String>,
+    layer_vote_list: Vec<String>,
+    excluded_levels: Vec<String>,
+    excluded_layers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -536,6 +598,14 @@ impl BitReader {
 
     fn at_end(&self) -> bool {
         self.offset >= self.last_bit
+    }
+
+    fn abs_bit_pos(&self) -> usize {
+        self.offset
+    }
+
+    fn set_abs_bit_pos(&mut self, pos: usize) {
+        self.offset = pos;
     }
 
     fn add_offset(&mut self, index: usize, bits: usize) -> Result<()> {
@@ -1135,11 +1205,7 @@ impl BitReader {
     /// Appends bytes and extends the visible bit window.
     ///
     /// Returns `Err` if `bit_count` claims more bits than `data` actually has.
-    fn append_data_from_checked(
-        &mut self,
-        data: &[u8],
-        bit_count: usize,
-    ) -> Result<()> {
+    fn append_data_from_checked(&mut self, data: &[u8], bit_count: usize) -> Result<()> {
         if bit_count > data.len().saturating_mul(8) {
             self.is_error = true;
             return Err(Error::InvalidReplay(
@@ -1295,10 +1361,7 @@ fn group_for_hint(state: &mut ParseState, hint: &str) -> Option<Arc<ExportGroup>
     Some(group)
 }
 
-fn resolve_hint_path(
-    state: &ParseState,
-    hint: &str,
-) -> Option<(Arc<ExportGroup>, String)> {
+fn resolve_hint_path(state: &ParseState, hint: &str) -> Option<(Arc<ExportGroup>, String)> {
     // 1. Exact path.
     if let Some(group) = state.groups_by_path.get(hint) {
         return Some((Arc::clone(group), hint.to_string()));
@@ -1351,6 +1414,16 @@ fn resolve_hint_path(
         }
     }
 
+    // 7. UE blueprint class names end in `_C`; try the suffixed form.
+    if !leaf.is_empty() && !leaf.ends_with("_C") {
+        let suffixed = format!("{leaf}_C");
+        if let Some(path) = state.groups_by_leaf.get(&suffixed) {
+            if let Some(group) = state.groups_by_path.get(path) {
+                return Some((Arc::clone(group), path.clone()));
+            }
+        }
+    }
+
     None
 }
 
@@ -1365,8 +1438,6 @@ fn resolve_rep_group(
             return Some(group);
         }
         if let Ok(net_guid) = raw.parse::<u32>() {
-            // Clone the path so the &state borrow from guid_to_path ends
-            // before we re-enter group_for_hint with &mut state.
             if let Some(path) = state.guid_to_path.get(&net_guid).cloned() {
                 if let Some(group) = group_for_hint(state, &path) {
                     return Some(group);
@@ -1674,6 +1745,235 @@ fn apply_squad_property(
                 squad.creator_eos_id = Some(value);
             }
         }
+        _ => {}
+    }
+}
+
+fn apply_game_state_property(
+    gs: &mut GameStateTemp,
+    property_name: &str,
+    decoded: &DecodedPropertyValue,
+) {
+    match property_name {
+        // Match identity
+        "ServerName" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.server_name = Some(v);
+            }
+        }
+        "GameModeName" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.game_mode = Some(v);
+            }
+        }
+        "MatchState" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.match_state = Some(v);
+            }
+        }
+        "MatchID" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.match_id = Some(v);
+            }
+        }
+        "MapName" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.map_name = Some(v);
+            }
+        }
+
+        // Server info
+        "MaxPlayers" => {
+            gs.max_players = decoded_preferred_u32(decoded);
+        }
+        "MessageOfTheDay" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.motd = Some(v);
+            }
+        }
+        "ServerTickRate" => {
+            gs.server_tick_rate = decoded
+                .float32
+                .or_else(|| decoded_preferred_u32(decoded).map(|v| v as f32));
+        }
+        "ServerStartTimeStamp" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.server_start_timestamp = Some(v);
+            }
+        }
+        "StartupLayer" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                gs.startup_layer = Some(v);
+            }
+        }
+
+        // Match config
+        "bIsTicketBasedGame" => {
+            gs.is_ticket_based = decoded.boolean;
+        }
+        "AuthorityNumTeams" => {
+            gs.authority_num_teams = decoded_preferred_u32(decoded);
+        }
+        "NumReservedSlots" => {
+            gs.num_reserved_slots = decoded_preferred_u32(decoded);
+        }
+        "PublicQueueLimit" => {
+            gs.public_queue_limit = decoded_preferred_u32(decoded);
+        }
+        "NumPlayersDiffForTeamChanges" => {
+            gs.num_players_diff_for_team_changes = decoded_preferred_u32(decoded);
+        }
+        "LowPlayerCountThreshold" => {
+            gs.low_player_count_threshold = decoded_preferred_u32(decoded);
+        }
+        "bCommunityAdminAccess" => {
+            gs.community_admin_access = decoded.boolean;
+        }
+
+        // Timing
+        "NoTeamChangeTimer" => {
+            gs.no_team_change_timer = decoded.float32;
+        }
+        "ServerMessageInterval" => {
+            gs.server_message_interval = decoded.float32;
+        }
+        "TimeBetweenMatches" => {
+            gs.time_between_matches = decoded.float32;
+        }
+        "TimeBeforeVote" => {
+            gs.time_before_vote = decoded.float32;
+        }
+
+        // Rotation & voting
+        "MapRotationMode" => {
+            gs.map_rotation_mode = decoded_preferred_u32(decoded);
+        }
+        "UseVoteLevel" => {
+            gs.use_vote_level = decoded.boolean;
+        }
+        "UseVoteLayer" => {
+            gs.use_vote_layer = decoded.boolean;
+        }
+        "LayerOptionsNumber" => {
+            gs.layer_options_number = decoded_preferred_u32(decoded);
+        }
+        "FactionOptionsNumber" => {
+            gs.faction_options_number = decoded_preferred_u32(decoded);
+        }
+        "MapSkipRounds" => {
+            gs.map_skip_rounds = decoded_preferred_u32(decoded);
+        }
+        "LayerSkipRounds" => {
+            gs.layer_skip_rounds = decoded_preferred_u32(decoded);
+        }
+        "FactionSkipRounds" => {
+            gs.faction_skip_rounds = decoded_preferred_u32(decoded);
+        }
+        "FactionSetupSkipRounds" => {
+            gs.faction_setup_skip_rounds = decoded_preferred_u32(decoded);
+        }
+        "bDisplayVotes" => {
+            gs.display_votes = decoded.boolean;
+        }
+        "bUniqueMapVote" => {
+            gs.unique_map_vote = decoded.boolean;
+        }
+
+        // Availability flags
+        "VehicleClaimingDisabled" => {
+            gs.vehicle_claiming_disabled = decoded.boolean;
+        }
+        "CommanderDisabled" => {
+            gs.commander_disabled = decoded.boolean;
+        }
+        "ForceAllRoleAvailability" => {
+            gs.force_all_role_availability = decoded.boolean;
+        }
+        "bHelicoptersAvailable" => {
+            gs.helicopters_available = decoded.boolean;
+        }
+        "bBoatsAvailable" => {
+            gs.boats_available = decoded.boolean;
+        }
+        "bTanksAvailable" => {
+            gs.tanks_available = decoded.boolean;
+        }
+        "ForceAllVehicleAvailability" => {
+            gs.force_all_vehicle_availability = decoded.boolean;
+        }
+        "ForceAllDeployableAvailability" => {
+            gs.force_all_deployable_availability = decoded.boolean;
+        }
+        "ForceAllActionAvailability" => {
+            gs.force_all_action_availability = decoded.boolean;
+        }
+        "ForceAllowCommanderActions" => {
+            gs.force_allow_commander_actions = decoded.boolean;
+        }
+        "ForceNoCommanderCooldowns" => {
+            gs.force_no_commander_cooldowns = decoded.boolean;
+        }
+        "NoRespawnTimer" => {
+            gs.no_respawn_timer = decoded.boolean;
+        }
+        "VehicleTeamRequirementDisabled" => {
+            gs.vehicle_team_requirement_disabled = decoded.boolean;
+        }
+        "VehicleKitRequirementDisabled" => {
+            gs.vehicle_kit_requirement_disabled = decoded.boolean;
+        }
+
+        // Arrays (accumulate unique values)
+        "ServerTags" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.server_tags.contains(&v) {
+                    gs.server_tags.push(v);
+                }
+            }
+        }
+        "LevelRotation" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.level_rotation.contains(&v) {
+                    gs.level_rotation.push(v);
+                }
+            }
+        }
+        "LayerRotation" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.layer_rotation.contains(&v) {
+                    gs.layer_rotation.push(v);
+                }
+            }
+        }
+        "LayerRotationLowPlayers" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.layer_rotation_low_players.contains(&v) {
+                    gs.layer_rotation_low_players.push(v);
+                }
+            }
+        }
+        "LayerVoteList" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.layer_vote_list.contains(&v) {
+                    gs.layer_vote_list.push(v);
+                }
+            }
+        }
+        "ExcludedLevels" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.excluded_levels.contains(&v) {
+                    gs.excluded_levels.push(v);
+                }
+            }
+        }
+        "ExcludedLayers" => {
+            if let Some(v) = meaningful_decoded_string(decoded) {
+                if !gs.excluded_layers.contains(&v) {
+                    gs.excluded_layers.push(v);
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -2634,6 +2934,10 @@ fn apply_property_event(
         }
     }
 
+    if context.group_leaf.contains("GameState") {
+        apply_game_state_property(&mut state.game_state, context.property_name, decoded);
+    }
+
     if context.classify_flags.is_soldier() && context.property_name == "ReplicatedMovement" {
         if let Some(movement) = &decoded.rep_movement {
             if let Some(location) = movement.location {
@@ -3189,78 +3493,80 @@ fn process_bunch(bunch: &mut Bunch, state: &mut ParseState) {
         matches!(state.channels.get(&bunch.ch_index), Some(channel) if channel.actor.is_none());
 
     if needs_actor_open {
-        if !bunch.b_open {
-            return;
-        }
+        if bunch.b_open {
+            let mut actor = OpenedActor {
+                actor_net_guid: decode_net_guid(&mut bunch.archive, false, state, 0),
+                ..OpenedActor::default()
+            };
 
-        let mut actor = OpenedActor {
-            actor_net_guid: decode_net_guid(&mut bunch.archive, false, state, 0),
-            ..OpenedActor::default()
-        };
-
-        if !bunch.archive.at_end() && actor.actor_net_guid.is_dynamic() {
-            actor.archetype = Some(decode_net_guid(&mut bunch.archive, false, state, 0));
-            if bunch.archive.header.engine_network_version >= 5 {
-                actor.level = Some(decode_net_guid(&mut bunch.archive, false, state, 0));
+            if !bunch.archive.at_end() && actor.actor_net_guid.is_dynamic() {
+                actor.archetype = Some(decode_net_guid(&mut bunch.archive, false, state, 0));
+                if bunch.archive.header.engine_network_version >= 5 {
+                    actor.level = Some(decode_net_guid(&mut bunch.archive, false, state, 0));
+                }
+                actor.location = Some(conditionally_serialize_quantized_vector(
+                    &mut bunch.archive,
+                    Vec3::default(),
+                ));
+                actor.rotation = Some(if bunch.archive.read_bit() {
+                    bunch.archive.read_rotation_short()
+                } else {
+                    Rotator::default()
+                });
+                actor.scale = Some(conditionally_serialize_quantized_vector(
+                    &mut bunch.archive,
+                    Vec3 {
+                        x: 1.0,
+                        y: 1.0,
+                        z: 1.0,
+                    },
+                ));
+                actor.velocity = Some(conditionally_serialize_quantized_vector(
+                    &mut bunch.archive,
+                    Vec3::default(),
+                ));
             }
-            actor.location = Some(conditionally_serialize_quantized_vector(
-                &mut bunch.archive,
-                Vec3::default(),
-            ));
-            actor.rotation = Some(if bunch.archive.read_bit() {
-                bunch.archive.read_rotation_short()
-            } else {
-                Rotator::default()
-            });
-            actor.scale = Some(conditionally_serialize_quantized_vector(
-                &mut bunch.archive,
-                Vec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            ));
-            actor.velocity = Some(conditionally_serialize_quantized_vector(
-                &mut bunch.archive,
-                Vec3::default(),
-            ));
-        }
 
-        let actor_guid = actor.actor_net_guid.value;
-        let archetype_path = actor
-            .archetype
-            .and_then(|guid| state.guid_to_path.get(&guid.value))
-            .cloned();
+            let actor_guid = actor.actor_net_guid.value;
+            let archetype_path = actor
+                .archetype
+                .and_then(|guid| state.guid_to_path.get(&guid.value))
+                .cloned();
 
-        let t_ms = (bunch.time_seconds.max(0.0) as f64 * 1000.0).round() as u64;
-        state.actor_builders.insert(
-            actor_guid,
-            ActorBuilder {
+            let t_ms = (bunch.time_seconds.max(0.0) as f64 * 1000.0).round() as u64;
+            state.actor_builders.insert(
                 actor_guid,
-                channel_index: bunch.ch_index,
-                class_name: archetype_path
-                    .as_deref()
-                    .and_then(normalize_type)
-                    .or_else(|| Some("Unknown".to_string())),
-                archetype_path,
-                open_time_ms: t_ms,
-                close_time_ms: None,
-                initial_location: actor.location,
-                initial_rotation: actor.rotation,
-                team: None,
-                build_state: None,
-                health: None,
-                owner: None,
-                notes: Vec::new(),
-            },
-        );
-        state.actor_opens += 1;
-        state.actor_to_channel.insert(actor_guid, bunch.ch_index);
-        state.channel_to_actor.insert(bunch.ch_index, actor_guid);
+                ActorBuilder {
+                    actor_guid,
+                    channel_index: bunch.ch_index,
+                    class_name: archetype_path
+                        .as_deref()
+                        .and_then(normalize_type)
+                        .or_else(|| Some("Unknown".to_string())),
+                    archetype_path,
+                    open_time_ms: t_ms,
+                    close_time_ms: None,
+                    initial_location: actor.location,
+                    initial_rotation: actor.rotation,
+                    team: None,
+                    build_state: None,
+                    health: None,
+                    owner: None,
+                    notes: Vec::new(),
+                },
+            );
+            state.actor_opens += 1;
+            state.actor_to_channel.insert(actor_guid, bunch.ch_index);
+            state.channel_to_actor.insert(bunch.ch_index, actor_guid);
 
-        if let Some(channel) = state.channels.get_mut(&bunch.ch_index) {
-            channel.actor = Some(actor);
+            if let Some(channel) = state.channels.get_mut(&bunch.ch_index) {
+                channel.actor = Some(actor);
+            }
         }
+        // When b_open is false the actor was never opened in this recording
+        // (e.g. game-state established before recording started). Fall
+        // through to process content blocks without an actor context —
+        // resolve_rep_group can still match via sub-object / class hints.
     }
 
     let actor = state
@@ -3287,9 +3593,135 @@ fn process_bunch(bunch: &mut Bunch, state: &mut ParseState) {
             actor.as_ref(),
             rep_object.as_deref(),
             sub_object_net_guid,
-        );
+        )
+        .or_else(|| state.channel_group_cache.get(&bunch.ch_index).cloned())
+        .or_else(|| {
+            // Last resort for actor-less channels (e.g. game state on
+            // recordings that started after the actor was established):
+            // if the channel has no actor, search the discovered export
+            // groups for a matching blueprint path.  We try the class
+            // path derived from `guid_to_path` for any GUID references
+            // the channel might carry.
+            if actor.is_none() {
+                // Try to find a matching group by checking rep_object
+                // numeric GUID → guid_to_path → groups_by_leaf (with _C).
+                if let Some(raw) = rep_object.as_deref() {
+                    if let Ok(guid) = raw.parse::<u32>() {
+                        if let Some(path) = state.guid_to_path.get(&guid) {
+                            let leaf = path.rsplit('/').next().unwrap_or(path);
+                            // Try with _C suffix (UE blueprint convention)
+                            let suffixed = format!("{leaf}_C");
+                            if let Some(group_path) = state.groups_by_leaf.get(&suffixed) {
+                                return state.groups_by_path.get(group_path).map(Arc::clone);
+                            }
+                            if let Some(group_path) = state.groups_by_leaf.get(leaf) {
+                                return state.groups_by_path.get(group_path).map(Arc::clone);
+                            }
+                        }
+                    }
+                }
+                // Try sub_object GUID
+                if let Some(guid) = sub_object_net_guid {
+                    if let Some(path) = state.guid_to_path.get(&guid) {
+                        let leaf = path.rsplit('/').next().unwrap_or(path);
+                        let suffixed = format!("{leaf}_C");
+                        if let Some(group_path) = state.groups_by_leaf.get(&suffixed) {
+                            return state.groups_by_path.get(group_path).map(Arc::clone);
+                        }
+                        if let Some(group_path) = state.groups_by_leaf.get(leaf) {
+                            return state.groups_by_path.get(group_path).map(Arc::clone);
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        // When normal resolution fails, try to identify the export group
+        // by peeking at property handles in the content block and matching
+        // them against discovered export groups.  This handles static
+        // actors (odd net GUIDs) whose GUIDs are never in `guid_to_path`
+        // — e.g. the game state actor.
+        let group = group.or_else(|| {
+            // Only attempt handle-based resolution for content blocks where
+            // normal GUID resolution failed.  Skip if the actor has a known
+            // archetype (those should resolve through the normal path).
+            let actor_has_archetype = actor.as_ref().is_some_and(|a| a.archetype.is_some());
+            if !out_has_rep_layout || actor_has_archetype {
+                return None;
+            }
+            // Peek at up to 3 property handles without consuming them.
+            let saved_pos = bunch.archive.abs_bit_pos();
+            let saved_error = bunch.archive.is_error;
+            bunch.archive.skip_bits(1); // leading bit in rep layout
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                if bunch.archive.is_error {
+                    break;
+                }
+                let h = bunch.archive.read_int_packed();
+                if h == 0 {
+                    break;
+                }
+                let h = h - 1;
+                // Skip the payload bits for this property.  Bound against
+                // the bits actually remaining so a corrupted/mismatched
+                // payload can't push the cursor past `last_bit` and force
+                // a confusing error during the real read after restore.
+                let num_bits = bunch.archive.read_int_packed() as usize;
+                if num_bits > bunch.archive.get_bits_left() {
+                    break;
+                }
+                if num_bits > 0 {
+                    bunch.archive.skip_bits(num_bits);
+                }
+                handles.push(h);
+            }
+            bunch.archive.set_abs_bit_pos(saved_pos);
+            bunch.archive.is_error = saved_error;
+
+            // A single handle is too ambiguous to safely fingerprint a
+            // group — many classes share their first replicated handle.
+            // Require at least two distinct handles before committing.
+            if handles.len() < 2 {
+                return None;
+            }
+
+            // Find export groups that contain ALL peeked handles.
+            let mut candidates: Vec<_> = state
+                .groups_by_path
+                .values()
+                .filter(|g| {
+                    g.net_field_exports_length > 5
+                        && handles.iter().all(|h| g.net_field_exports.contains_key(h))
+                })
+                .collect();
+
+            if candidates.len() == 1 {
+                return Some(Arc::clone(candidates[0]));
+            }
+            // Ambiguous: pick the candidate with the most registered field
+            // exports — more-specific classes (like the game state) have many
+            // properties, so they tend to win this tiebreaker.
+            if candidates.len() > 1 {
+                candidates
+                    .sort_by(|a, b| b.net_field_exports.len().cmp(&a.net_field_exports.len()));
+                let best = &candidates[0];
+                let second = &candidates[1];
+                if best.net_field_exports.len() > second.net_field_exports.len() {
+                    return Some(Arc::clone(best));
+                }
+            }
+            None
+        });
 
         if let Some(group) = group {
+            // Cache successful resolution so actor-less channels (e.g.
+            // game state on late-join recordings) can reuse the group.
+            state
+                .channel_group_cache
+                .entry(bunch.ch_index)
+                .or_insert_with(|| Arc::clone(&group));
             if out_has_rep_layout {
                 read_rep_layout_properties(
                     &mut bunch.archive,
@@ -4595,6 +5027,21 @@ fn parse_data(
 
     let map_name = header.level_names_and_times.keys().next().cloned();
 
+    let layer_name = map_name
+        .as_deref()
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|segment| !segment.is_empty())
+        .map(String::from);
+
+    let friendly_name = {
+        let trimmed = outer.friendly_name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
     let kills = finalize_kills(&state, &players);
     let (teams, squads, seat_changes) = finalize_roster_and_seats(&state, &mut players);
 
@@ -4618,6 +5065,8 @@ fn parse_data(
                 notes: Vec::new(),
             },
             map_name,
+            layer_name,
+            friendly_name,
             squad_version: Some(header.branch.clone()),
             duration_ms: outer.length_in_ms as u64,
             started_at: None,
@@ -4625,6 +5074,62 @@ fn parse_data(
                 "Canonical bundle produced directly from a single replay ingest.".to_string(),
                 "Compatibility JSON is derived from this canonical representation.".to_string(),
             ],
+        },
+        game_state: GameStateInfo {
+            server_name: state.game_state.server_name,
+            game_mode: state.game_state.game_mode,
+            match_state: state.game_state.match_state,
+            match_id: state.game_state.match_id,
+            map_name: state.game_state.map_name,
+            max_players: state.game_state.max_players,
+            motd: state.game_state.motd,
+            server_tick_rate: state.game_state.server_tick_rate,
+            server_start_timestamp: state.game_state.server_start_timestamp,
+            startup_layer: state.game_state.startup_layer,
+            is_ticket_based: state.game_state.is_ticket_based,
+            authority_num_teams: state.game_state.authority_num_teams,
+            num_reserved_slots: state.game_state.num_reserved_slots,
+            public_queue_limit: state.game_state.public_queue_limit,
+            num_players_diff_for_team_changes: state.game_state.num_players_diff_for_team_changes,
+            low_player_count_threshold: state.game_state.low_player_count_threshold,
+            community_admin_access: state.game_state.community_admin_access,
+            no_team_change_timer: state.game_state.no_team_change_timer,
+            server_message_interval: state.game_state.server_message_interval,
+            time_between_matches: state.game_state.time_between_matches,
+            time_before_vote: state.game_state.time_before_vote,
+            map_rotation_mode: state.game_state.map_rotation_mode,
+            use_vote_level: state.game_state.use_vote_level,
+            use_vote_layer: state.game_state.use_vote_layer,
+            layer_options_number: state.game_state.layer_options_number,
+            faction_options_number: state.game_state.faction_options_number,
+            map_skip_rounds: state.game_state.map_skip_rounds,
+            layer_skip_rounds: state.game_state.layer_skip_rounds,
+            faction_skip_rounds: state.game_state.faction_skip_rounds,
+            faction_setup_skip_rounds: state.game_state.faction_setup_skip_rounds,
+            display_votes: state.game_state.display_votes,
+            unique_map_vote: state.game_state.unique_map_vote,
+            vehicle_claiming_disabled: state.game_state.vehicle_claiming_disabled,
+            commander_disabled: state.game_state.commander_disabled,
+            force_all_role_availability: state.game_state.force_all_role_availability,
+            helicopters_available: state.game_state.helicopters_available,
+            boats_available: state.game_state.boats_available,
+            tanks_available: state.game_state.tanks_available,
+            force_all_vehicle_availability: state.game_state.force_all_vehicle_availability,
+            force_all_deployable_availability: state.game_state.force_all_deployable_availability,
+            force_all_action_availability: state.game_state.force_all_action_availability,
+            force_allow_commander_actions: state.game_state.force_allow_commander_actions,
+            force_no_commander_cooldowns: state.game_state.force_no_commander_cooldowns,
+            no_respawn_timer: state.game_state.no_respawn_timer,
+            vehicle_team_requirement_disabled: state.game_state.vehicle_team_requirement_disabled,
+            vehicle_kit_requirement_disabled: state.game_state.vehicle_kit_requirement_disabled,
+            server_tags: state.game_state.server_tags,
+            level_rotation: state.game_state.level_rotation,
+            layer_rotation: state.game_state.layer_rotation,
+            layer_rotation_low_players: state.game_state.layer_rotation_low_players,
+            layer_vote_list: state.game_state.layer_vote_list,
+            excluded_levels: state.game_state.excluded_levels,
+            excluded_layers: state.game_state.excluded_layers,
+            notes: Vec::new(),
         },
         teams,
         squads,
@@ -5280,7 +5785,7 @@ mod tests {
     fn read_string_rejects_i32_min_length_without_allocating_giants() {
         // Bad UTF-16 length, tiny payload.
         let mut bytes = vec![0x00, 0x00, 0x00, 0x80]; // length prefix
-        bytes.extend_from_slice(&[0, 0, 0, 0]);      // padding
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // padding
         let mut reader = reader_from_bytes(bytes);
         let start = std::time::Instant::now();
         let s = reader.read_string();

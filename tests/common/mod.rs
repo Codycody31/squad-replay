@@ -83,6 +83,7 @@ pub const FIXTURES: &[FixtureSpec] = &[
 pub struct FixtureSnapshot {
     pub source: SourceSnapshot,
     pub replay: ReplaySnapshot,
+    pub game_state: GameStateSnapshot,
     pub counts: CountsSnapshot,
     pub actors: ActorsSnapshot,
     pub tracks: TracksSnapshot,
@@ -104,8 +105,21 @@ pub struct SourceSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplaySnapshot {
     pub map_name: Option<String>,
+    pub layer_name: Option<String>,
+    pub friendly_name: Option<String>,
     pub squad_version: Option<String>,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GameStateSnapshot {
+    pub server_name: Option<String>,
+    pub game_mode: Option<String>,
+    pub match_state: Option<String>,
+    pub max_players: Option<u32>,
+    pub is_ticket_based: Option<bool>,
+    pub server_tags_count: usize,
+    pub layer_rotation_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -239,8 +253,19 @@ impl FixtureSnapshot {
             },
             replay: ReplaySnapshot {
                 map_name: bundle.replay.map_name.clone(),
+                layer_name: bundle.replay.layer_name.clone(),
+                friendly_name: bundle.replay.friendly_name.clone(),
                 squad_version: bundle.replay.squad_version.clone(),
                 duration_ms: bundle.replay.duration_ms,
+            },
+            game_state: GameStateSnapshot {
+                server_name: bundle.game_state.server_name.clone(),
+                game_mode: bundle.game_state.game_mode.clone(),
+                match_state: bundle.game_state.match_state.clone(),
+                max_players: bundle.game_state.max_players,
+                is_ticket_based: bundle.game_state.is_ticket_based,
+                server_tags_count: bundle.game_state.server_tags.len(),
+                layer_rotation_count: bundle.game_state.layer_rotation.len(),
             },
             counts: CountsSnapshot {
                 teams: bundle.teams.len(),
@@ -321,18 +346,13 @@ pub fn assert_snapshot_matches(path: &Path, actual: &FixtureSnapshot) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("snapshot parent dir should be creatable");
         }
-        std::fs::write(path, &pretty).unwrap_or_else(|error| {
-            panic!(
-                "failed to write snapshot {}: {error}",
-                path.display()
-            )
-        });
+        std::fs::write(path, &pretty)
+            .unwrap_or_else(|error| panic!("failed to write snapshot {}: {error}", path.display()));
         return;
     }
 
-    let existing = std::fs::read_to_string(path).unwrap_or_else(|error| {
-        panic!("failed to read snapshot {}: {error}", path.display())
-    });
+    let existing = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read snapshot {}: {error}", path.display()));
     let expected: FixtureSnapshot = serde_json::from_str(&existing).unwrap_or_else(|error| {
         panic!(
             "snapshot {} is not valid FixtureSnapshot json: {error}\n\
@@ -451,4 +471,3 @@ pub fn sample_bundle() -> Bundle {
         ..Bundle::default()
     }
 }
-

@@ -264,9 +264,7 @@ fn write_outputs(
         serde_json::to_writer_pretty(&mut writer, &compat::from_bundle(bundle))?;
         // Explicit flush: `BufWriter::drop` swallows flush errors; without
         // this we could report success while leaving a truncated file.
-        writer
-            .flush()
-            .map_err(|source| io_err(&path, source))?;
+        writer.flush().map_err(|source| io_err(&path, source))?;
         written.compat_json = Some(path);
     }
 

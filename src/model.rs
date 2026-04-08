@@ -38,6 +38,8 @@ pub struct ReplayInfoSection {
     pub source: ReplaySourceInfo,
     pub engine: ReplayEngineInfo,
     pub map_name: Option<String>,
+    pub layer_name: Option<String>,
+    pub friendly_name: Option<String>,
     pub squad_version: Option<String>,
     pub duration_ms: u64,
     pub started_at: Option<String>,
@@ -364,9 +366,82 @@ pub struct Diagnostics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GameStateInfo {
+    // Match identity
+    pub server_name: Option<String>,
+    pub game_mode: Option<String>,
+    pub match_state: Option<String>,
+    pub match_id: Option<String>,
+    pub map_name: Option<String>,
+
+    // Server info
+    pub max_players: Option<u32>,
+    pub motd: Option<String>,
+    pub server_tick_rate: Option<f32>,
+    pub server_start_timestamp: Option<String>,
+    pub startup_layer: Option<String>,
+
+    // Match config
+    pub is_ticket_based: Option<bool>,
+    pub authority_num_teams: Option<u32>,
+    pub num_reserved_slots: Option<u32>,
+    pub public_queue_limit: Option<u32>,
+    pub num_players_diff_for_team_changes: Option<u32>,
+    pub low_player_count_threshold: Option<u32>,
+    pub community_admin_access: Option<bool>,
+
+    // Timing
+    pub no_team_change_timer: Option<f32>,
+    pub server_message_interval: Option<f32>,
+    pub time_between_matches: Option<f32>,
+    pub time_before_vote: Option<f32>,
+
+    // Rotation & voting
+    pub map_rotation_mode: Option<u32>,
+    pub use_vote_level: Option<bool>,
+    pub use_vote_layer: Option<bool>,
+    pub layer_options_number: Option<u32>,
+    pub faction_options_number: Option<u32>,
+    pub map_skip_rounds: Option<u32>,
+    pub layer_skip_rounds: Option<u32>,
+    pub faction_skip_rounds: Option<u32>,
+    pub faction_setup_skip_rounds: Option<u32>,
+    pub display_votes: Option<bool>,
+    pub unique_map_vote: Option<bool>,
+
+    // Availability flags (mode-specific, all optional)
+    pub vehicle_claiming_disabled: Option<bool>,
+    pub commander_disabled: Option<bool>,
+    pub force_all_role_availability: Option<bool>,
+    pub helicopters_available: Option<bool>,
+    pub boats_available: Option<bool>,
+    pub tanks_available: Option<bool>,
+    pub force_all_vehicle_availability: Option<bool>,
+    pub force_all_deployable_availability: Option<bool>,
+    pub force_all_action_availability: Option<bool>,
+    pub force_allow_commander_actions: Option<bool>,
+    pub force_no_commander_cooldowns: Option<bool>,
+    pub no_respawn_timer: Option<bool>,
+    pub vehicle_team_requirement_disabled: Option<bool>,
+    pub vehicle_kit_requirement_disabled: Option<bool>,
+
+    // Arrays (accumulated from repeated property events)
+    pub server_tags: Vec<String>,
+    pub level_rotation: Vec<String>,
+    pub layer_rotation: Vec<String>,
+    pub layer_rotation_low_players: Vec<String>,
+    pub layer_vote_list: Vec<String>,
+    pub excluded_levels: Vec<String>,
+    pub excluded_layers: Vec<String>,
+
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Bundle {
     pub schema: SchemaInfo,
     pub replay: ReplayInfoSection,
+    pub game_state: GameStateInfo,
     pub teams: Vec<Team>,
     pub squads: Vec<Squad>,
     pub players: Vec<Player>,
