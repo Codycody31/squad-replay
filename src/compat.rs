@@ -48,6 +48,8 @@ fn fill_forward_tracks(
     out
 }
 
+/// Convert a [`Bundle`] into the legacy [`CompatMatch`] JSON shape used by
+/// older Squad replay tools.
 pub fn from_bundle(bundle: &Bundle) -> CompatMatch {
     let duration_seconds = (bundle.replay.duration_ms / 1000) as u32;
 

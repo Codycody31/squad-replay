@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Convenience alias for `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errors that can occur during replay parsing and bundle I/O.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error at {path}: {source}")]

@@ -1,7 +1,16 @@
+//! Data model for parsed Squad replay bundles.
+//!
+//! [`Bundle`] is the top-level container returned by [`crate::parse_file`]
+//! and [`crate::parse_bytes`]. It holds every piece of data extracted from
+//! a Squad `.replay` file.
+
+#![allow(missing_docs)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Schema metadata embedded in serialized bundles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInfo {
     pub name: String,
@@ -19,6 +28,7 @@ impl Default for SchemaInfo {
     }
 }
 
+/// Source file identity (name, size, hash).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReplaySourceInfo {
     pub file_name: String,
@@ -26,6 +36,7 @@ pub struct ReplaySourceInfo {
     pub sha256: String,
 }
 
+/// Unreal Engine version and network metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReplayEngineInfo {
     pub engine_version: Option<String>,
@@ -33,6 +44,7 @@ pub struct ReplayEngineInfo {
     pub notes: Vec<String>,
 }
 
+/// Top-level replay metadata (source, engine, map, duration).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReplayInfoSection {
     pub source: ReplaySourceInfo,
@@ -46,6 +58,7 @@ pub struct ReplayInfoSection {
     pub notes: Vec<String>,
 }
 
+/// A team in the match (e.g. US Army, Russian Ground Forces).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Team {
     pub id: u32,
@@ -58,6 +71,7 @@ pub struct Team {
     pub notes: Vec<String>,
 }
 
+/// A squad within a team.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Squad {
     pub id: u32,
@@ -77,6 +91,7 @@ pub struct Squad {
     pub notes: Vec<String>,
 }
 
+/// An individual player observed during the match.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Player {
     pub player_state_guid: u32,
@@ -105,6 +120,7 @@ pub struct Player {
     pub notes: Vec<String>,
 }
 
+/// 3-D position vector.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct Vec3 {
     pub x: f64,
@@ -112,6 +128,7 @@ pub struct Vec3 {
     pub z: f64,
 }
 
+/// Euler rotation (pitch / yaw / roll).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct Rotator {
     pub pitch: f64,
@@ -119,6 +136,7 @@ pub struct Rotator {
     pub roll: f64,
 }
 
+/// Replicated movement state for a networked actor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepMovement {
     pub location: Option<Vec3>,
@@ -130,6 +148,7 @@ pub struct RepMovement {
     pub rep_physics: bool,
 }
 
+/// Decoded value of a single replicated property.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DecodedPropertyValue {
     pub bits: u32,
@@ -143,6 +162,7 @@ pub struct DecodedPropertyValue {
     pub rep_movement: Option<Box<RepMovement>>,
 }
 
+/// A single property replication event from the network stream.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PropertyEvent {
     pub t_ms: u64,
@@ -158,6 +178,7 @@ pub struct PropertyEvent {
     pub decoded: DecodedPropertyValue,
 }
 
+/// A networked actor (vehicle, deployable, etc.) observed in the replay.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ActorEntity {
     pub actor_guid: u32,
@@ -175,6 +196,7 @@ pub struct ActorEntity {
     pub notes: Vec<String>,
 }
 
+/// A sub-object component attached to an actor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComponentEntity {
     pub component_guid: u32,
@@ -189,6 +211,7 @@ pub struct ComponentEntity {
     pub notes: Vec<String>,
 }
 
+/// Categorized collections of actors extracted from the replay.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ActorGroups {
     pub vehicles: Vec<ActorEntity>,
@@ -197,6 +220,7 @@ pub struct ActorGroups {
     pub components: Vec<ComponentEntity>,
 }
 
+/// A single timestamped 3-D position sample.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackSample3 {
     pub t_ms: u64,
@@ -205,6 +229,7 @@ pub struct TrackSample3 {
     pub z: f64,
 }
 
+/// A named position track (series of [`TrackSample3`] samples).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track3 {
     pub key: String,
@@ -215,6 +240,7 @@ pub struct Track3 {
     pub samples: Vec<TrackSample3>,
 }
 
+/// Categorized position tracks (players, vehicles, helicopters).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackGroups {
     pub players: Vec<Track3>,
@@ -222,6 +248,7 @@ pub struct TrackGroups {
     pub helicopters: Vec<Track3>,
 }
 
+/// A kill or incapacitation event.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KillEvent {
     pub t_ms: u64,
@@ -233,6 +260,7 @@ pub struct KillEvent {
     pub was_incap: Option<bool>,
 }
 
+/// A deployable placement event (FOB, HAB, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeploymentEvent {
     pub t_ms: u64,
@@ -245,6 +273,7 @@ pub struct DeploymentEvent {
     pub z: Option<f64>,
 }
 
+/// A vehicle seat change (enter, exit, swap).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeatChangeEvent {
     pub t_ms: u64,
@@ -259,6 +288,7 @@ pub struct SeatChangeEvent {
     pub value: Option<String>,
 }
 
+/// A state change on a component sub-object.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComponentStateEvent {
     pub t_ms: u64,
@@ -281,6 +311,7 @@ pub struct ComponentStateEvent {
     pub value_string: Option<String>,
 }
 
+/// A state change on a vehicle actor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VehicleStateEvent {
     pub t_ms: u64,
@@ -301,6 +332,7 @@ pub struct VehicleStateEvent {
     pub value_string: Option<String>,
 }
 
+/// A state change on a weapon actor.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WeaponStateEvent {
     pub t_ms: u64,
@@ -321,6 +353,7 @@ pub struct WeaponStateEvent {
     pub value_string: Option<String>,
 }
 
+/// All classified game events extracted from the replay.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventGroups {
     pub kills: Vec<KillEvent>,
@@ -332,6 +365,7 @@ pub struct EventGroups {
     pub properties: Vec<PropertyEvent>,
 }
 
+/// Raw string inventory collected during parsing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StringInventory {
     pub ascii_strings: Vec<String>,
@@ -340,6 +374,7 @@ pub struct StringInventory {
     pub ids: Vec<String>,
 }
 
+/// Provenance record for a piece of extracted data.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvenanceEntry {
     pub family: String,
@@ -348,6 +383,7 @@ pub struct ProvenanceEntry {
     pub notes: Vec<String>,
 }
 
+/// Parser diagnostics and statistics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Diagnostics {
     pub frames_processed: u64,
@@ -365,6 +401,7 @@ pub struct Diagnostics {
     pub provenance_report: Vec<ProvenanceEntry>,
 }
 
+/// Server and match configuration derived from game-state replication.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GameStateInfo {
     // Match identity
@@ -437,6 +474,11 @@ pub struct GameStateInfo {
     pub notes: Vec<String>,
 }
 
+/// Top-level container holding all data extracted from a Squad replay.
+///
+/// Returned by [`crate::parse_file`] and [`crate::parse_bytes`], and
+/// (de)serializable to `.sqrj.json` / `.sqrb` via the [`crate::sqrj`] and
+/// [`crate::sqrb`] modules.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Bundle {
     pub schema: SchemaInfo,
@@ -451,6 +493,7 @@ pub struct Bundle {
     pub diagnostics: Diagnostics,
 }
 
+/// Legacy-format kill event for [`CompatMatch`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatKillEvent {
     pub timestamp: u32,
@@ -466,12 +509,14 @@ pub struct CompatKillEvent {
     pub was_incap: bool,
 }
 
+/// Aggregated kill/death stats in the legacy format.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatPlayerStat {
     pub kills: u32,
     pub deaths: u32,
 }
 
+/// Legacy-format deployable placement event.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatDeployableEvent {
     pub r#type: String,
@@ -483,6 +528,7 @@ pub struct CompatDeployableEvent {
     pub z: f64,
 }
 
+/// Parser statistics in the legacy JSON shape.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatDebugStats {
     #[serde(rename = "framesProcessed")]
@@ -505,6 +551,9 @@ pub struct CompatDebugStats {
     pub guid_to_path_size: usize,
 }
 
+/// Legacy match JSON produced by [`crate::compat::from_bundle`].
+///
+/// Mirrors the shape expected by older Squad replay tools.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatMatch {
     #[serde(rename = "mapName")]
@@ -530,6 +579,7 @@ pub struct CompatMatch {
     pub debug_stats: CompatDebugStats,
 }
 
+/// Options controlling replay parsing behavior.
 #[derive(Debug, Clone)]
 pub struct ParseOptions {
     pub include_property_events: bool,
