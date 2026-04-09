@@ -1,0 +1,5 @@
+[alias]
+bench-parse = "bench --bench parse"
+bench-serialize = "bench --bench serialization"
+bench-classify = "bench --features bench-internals --bench classify"
+bench-all = "bench --features bench-internals"

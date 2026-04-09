@@ -1,0 +1,157 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benches/**"
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benches/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache Cargo registry, git checkouts, and build artifacts.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: bench-${{ runner.os }}-
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      # Restore the main-branch Criterion baseline from cache.
+      - uses: actions/cache@v4
+        id: baseline-cache
+        with:
+          path: target/criterion-baseline
+          key: criterion-baseline-main-${{ github.run_id }}
+          restore-keys: criterion-baseline-main-
+
+      - name: Verify fixtures exist
+        run: |
+          for f in tests/fixtures/rtb-fallujah-seeding-20260406.replay \
+                   tests/fixtures/rtb-jensens-range-wpmc-vs-turkey-20260407.replay; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: Required fixture missing: $f"
+              exit 1
+            fi
+          done
+
+      # --- Main branch: save baseline ----------------------------------------
+      - name: Run benchmarks (main)
+        if: github.event_name == 'push'
+        run: |
+          cargo bench --bench parse --bench serialization --bench classify --features bench-internals -- --save-baseline main
+          mkdir -p target/criterion-baseline
+          cp -r target/criterion/main target/criterion-baseline/ 2>/dev/null || true
+
+      # --- Pull request: compare against main ---------------------------------
+      - name: Run benchmarks (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Restore cached main baseline into Criterion's expected location.
+          if [ -d target/criterion-baseline/main ]; then
+            mkdir -p target/criterion
+            cp -r target/criterion-baseline/main target/criterion/main
+          fi
+          cargo bench --bench parse --bench serialization --bench classify --features bench-internals -- --save-baseline pr
+
+      - name: Compare benchmarks
+        if: github.event_name == 'pull_request'
+        id: compare
+        run: |
+          if [ -d target/criterion/main ]; then
+            OUTPUT=$(critcmp main pr --threshold 5 2>&1) || true
+            {
+              echo "comparison<<EOF"
+              echo "$OUTPUT"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            if echo "$OUTPUT" | grep -q "Regressed"; then
+              echo "has_regression=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_regression=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "comparison=No baseline found for main. Run benchmarks on main first." >> "$GITHUB_OUTPUT"
+            echo "has_regression=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comparison = `${{ steps.compare.outputs.comparison }}`;
+            const hasRegression = '${{ steps.compare.outputs.has_regression }}' === 'true';
+            const marker = '<!-- benchmark-results -->';
+            const body = [
+              marker,
+              `## ${hasRegression ? '\u26a0\ufe0f' : '\u2705'} Benchmark Results`,
+              '',
+              '```',
+              comparison,
+              '```',
+              '',
+              hasRegression
+                ? '**Regression detected (>5% slower).** Please verify this is expected.'
+                : 'No significant regressions detected.',
+              '',
+              `<sub>Compared against \`master\` baseline. Threshold: 5%.</sub>`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # Upload HTML reports for manual inspection.
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: target/criterion/**/report/
+          retention-days: 30

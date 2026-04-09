@@ -110,3 +110,18 @@ pub fn read_bundle(path: impl AsRef<Path>) -> Result<Bundle> {
         path.display()
     )))
 }
+
+/// Re-exports of internal types for benchmark-only access.
+///
+/// This module is gated behind the `bench-internals` Cargo feature and is
+/// **not** part of the public API.  It exists solely so that Criterion
+/// benchmarks in `benches/classify.rs` can exercise the classification
+/// hot-path without making the `classify` module permanently public.
+#[cfg(feature = "bench-internals")]
+pub mod bench_internals {
+    pub use crate::classify::{
+        ClassifyFlags, classify_deployable_event_type, infer_component_type_name,
+        infer_group_leaf, is_deployable_primary_type, is_helicopter_type, is_soldier_type,
+        is_vehicle_type, normalize_type,
+    };
+}
